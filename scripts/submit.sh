@@ -8,6 +8,7 @@ done
 [[ -f runtime/metadata/inputs_manifest.json ]] || { echo 'Run bash scripts/setup.sh first.' >&2; exit 1; }
 [[ -f .venv/bin/python ]] || { echo 'Python environment missing.' >&2; exit 1; }
 .venv/bin/python scripts/install_bwrap.py --check
+.venv/bin/python scripts/check_model_imports.py --offline
 # Preserve actual resource evidence in scratch. Do not modify the experiment if
 # the expected allocation is unavailable: fail on configuration, queue on load.
 sinfo -p l40s -o '%P %a %l %D %G' > runtime/preflight/partition.txt

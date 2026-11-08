@@ -14,8 +14,20 @@ The model is
 `a284e895a6248256baf2f60502e54aba61b24c1a`. Its custom architecture is
 `A2DQwen2LMHeadModel`, model type `a2d-qwen2`, with padding-only bidirectional
 attention and no causal logit shift. Its mask token is `<|mask|>` (151665).
-The loader uses `AutoModelForMaskedLM` with pinned trusted custom code and
-explicit eager attention. It never loads the original autoregressive model.
+The loader imports the pinned model's unchanged Python source, verifies SHA-256
+`708c3f667f7b4eac3fd504ace32e1ee7171cfbfbbc6b6d9d95eda0353a779710`,
+and uses its explicit `A2DQwen2Config` and `A2DQwen2LMHeadModel` classes with the
+standard Hugging Face `from_pretrained` weight loader and eager attention. It
+never loads the original autoregressive model.
+
+The checkpoint's source contains `import dllm` only in a standalone `__main__`
+example. Transformers' Auto-class static import scanner nevertheless checks that
+import. Importing the exact file under its module name skips the unused example
+and preserves every model definition. No dummy `dllm` package, source rewriting,
+or dependency-check monkeypatch is used. Installing the full upstream package
+would also import unrelated evaluation/training dependencies. Setup exercises
+the actual pinned classes with a tiny CPU checkpoint before GPU submission;
+its source/hash/load/gradient evidence is uploaded with other provenance.
 
 The recorded sampler reproduces the upstream fixed schedule: four sequential
 64-token blocks, 256 total iterations, one commitment per iteration, temperature

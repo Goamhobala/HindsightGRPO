@@ -64,3 +64,26 @@ the actual Linux build and namespace probe remain cluster verification steps.
 bash -n scripts/env.sh scripts/setup.sh scripts/submit.sh slurm/run.sh
 passed
 ```
+
+## Checkpoint import scanner fix — 8 November 2026
+
+The pinned Hugging Face model source imports `dllm` only in its `__main__`
+conversion example. Transformers' Auto-class dependency scan includes that
+guarded import. The loader now executes the exact, SHA-verified checkpoint file
+under a module name, then uses its explicit config/model classes with standard
+Hugging Face weight loading. No model source is rewritten, no import check is
+patched, and no substitute `dllm` module is installed.
+
+The regression suite contains an exact model-source/config fixture. It verifies
+forward logits, bidirectionality, LoRA/input gradients, standard tiny-checkpoint
+save/load, the production loader's explicit class route, offline cache policy,
+and rejection of changed source or unpinned model revisions. Setup/submission
+now run the same small CPU architecture check before queueing GPU jobs.
+
+```text
+.venv/bin/python -m pytest -q
+118 passed, 1 skipped in 32.52s
+```
+
+This uses small random CPU weights in the actual architecture. Full pretrained
+0.5B weight loading and BF16 remain the compute-node GPU preflight.

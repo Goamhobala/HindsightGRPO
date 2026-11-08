@@ -64,7 +64,9 @@ Pins:
 | [dLLM upstream](https://github.com/ZHZisZZ/dllm) | `ca176752fbceec49c6b4777a2c18ae88e4eb10ed` |
 | [Official MBPP full](https://huggingface.co/datasets/google-research-datasets/mbpp) | `4bb6404fdc6cacfda99d4ac4205087b89d32030c` |
 
-`uv.lock` pins transitive dependencies. Torch 2.6.0 and Transformers 4.57.1 are tested locally. Upstream specified Transformers 4.57.0, which is yanked for installation problems; this uses its patched 4.57.1 release. The architecture loads the immutable checkpoint's custom bidirectional code with `trust_remote_code=True`; its source hashes and dataset fingerprints are recorded and uploaded. Upstream is separately checked out for audit; its optional DeepSpeed stack is unnecessary for these single-GPU jobs.
+`uv.lock` pins transitive dependencies. Torch 2.6.0 and Transformers 4.57.1 are tested locally. Upstream specified Transformers 4.57.0, which is yanked for installation problems; this uses its patched 4.57.1 release. The loader imports the immutable checkpoint's unchanged bidirectional Python source, verifies its expected SHA-256, and calls those explicit config/model classes' Hugging Face `from_pretrained` methods. The checkpoint file's `__main__` example imports `dllm`; Transformers' Auto-class static scanner treats that example-only import as a runtime dependency. Explicit class loading avoids that false dependency without changing the model source or architecture. Upstream is separately checked out for audit; installing its optional evaluation/DeepSpeed/TRL stack is unnecessary for these single-GPU jobs.
+
+Setup and submission also run `scripts/check_model_imports.py --offline`: a tiny CPU instance of the actual pinned architecture is loaded, saved/reloaded, and checked for forward, input-embedding gradients, and LoRA updates. This catches model-import/loader failures before jobs are queued. The report is `runtime/metadata/model_imports.json`; the full 0.5B BF16 checkpoint remains a GPU preflight check.
 
 ## W&B and outputs
 

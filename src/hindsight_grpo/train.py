@@ -112,6 +112,7 @@ class Experiment:
             runtime / "metadata" / "inputs_manifest.json",
             runtime / "metadata" / "dataset_manifest.json",
             runtime / "metadata" / "bubblewrap.json",
+            runtime / "metadata" / "model_imports.json",
             runtime / "installed-requirements.txt",
             runtime / "preflight" / group / f"{arm}.json",
             runtime / "preflight" / "partition.txt",

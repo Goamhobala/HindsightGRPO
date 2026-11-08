@@ -9,6 +9,9 @@ uv sync --frozen --python 3.11
 # Pinned HF remote code provides the architecture. The upstream source is kept
 # for the reproducibility audit, rather than installing its optional DeepSpeed stack.
 .venv/bin/python scripts/prepare.py
+# Exercise the actual pinned architecture and HF checkpoint loader on a tiny CPU
+# model before allocating GPUs. This downloads no additional full model weights.
+.venv/bin/python scripts/check_model_imports.py --offline
 uv pip freeze --python .venv/bin/python > runtime/installed-requirements.txt
 .venv/bin/python -m pytest
 echo 'Setup and CPU checks passed. Next: export WANDB_API_KEY, then bash scripts/submit.sh.'
