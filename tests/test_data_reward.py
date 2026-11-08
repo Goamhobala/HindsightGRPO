@@ -7,7 +7,7 @@ from hindsight_grpo.data import (
     DATASET_REVISION, EXPECTED_SPLIT_SIZES, extract_code,
     implementation_span, implementation_token_mask, prompt_for,
 )
-from hindsight_grpo.rewards import RewardRunner, SandboxUnavailable
+from hindsight_grpo.rewards import RewardRunner, SandboxUnavailable, find_bubblewrap
 
 
 def test_official_configuration_and_no_solution_in_prompt():
@@ -101,8 +101,7 @@ def test_partial_fraction_and_error_reporting():
 def test_actual_sandbox_reward_and_simple_harness_mutations():
     import os
     import platform
-    import shutil
-    if platform.system() != "Linux" or shutil.which("bwrap") is None or not os.environ.get("SLURM_JOB_ID"):
+    if platform.system() != "Linux" or find_bubblewrap() is None or not os.environ.get("SLURM_JOB_ID"):
         pytest.skip("Linux bubblewrap integration requires a SLURM compute-node environment")
     runner = RewardRunner(require_slurm=False)
     runner.check_available()

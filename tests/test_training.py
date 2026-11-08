@@ -1,9 +1,11 @@
 """Synthetic full-loop checks: no network, GPU allocation, or generated-code exec."""
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import copy
 from dataclasses import dataclass, asdict
 import json
+import errno
 from pathlib import Path
+import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -91,6 +93,8 @@ class FakeTracker:
         pass
     def summary(self, value):
         self.final_summary = value
+    def finish(self, exit_code=0):
+        self.finished_exit_code = exit_code
 
 
 def small_config():
@@ -122,7 +126,8 @@ class TrainingTests(unittest.TestCase):
         self.stack.enter_context(patch('hindsight_grpo.train.implementation_token_mask',
             side_effect=lambda ids, tokenizer: [True] * len(ids)))
         for name, value in [('is_available', True), ('device_count', 0),
-                            ('max_memory_allocated', 0), ('get_rng_state_all', [])]:
+                            ('max_memory_allocated', 0), ('get_rng_state_all', []),
+                            ('is_current_stream_capturing', False)]:
             self.stack.enter_context(patch.object(torch.cuda, name, return_value=value))
         for name in ('manual_seed_all', 'synchronize', 'set_rng_state_all'):
             self.stack.enter_context(patch.object(torch.cuda, name))
@@ -130,13 +135,28 @@ class TrainingTests(unittest.TestCase):
         self.stack.close()
         torch.set_num_threads(self.previous_threads)
     def create(self, directory, arm='root', verify=True):
-        return Experiment(small_config(), arm, directory, 'synthetic', verify=verify)
+        experiment = Experiment(small_config(), arm, directory, 'synthetic', verify=verify)
+        self.directory_resources.enter_context(experiment)
+        return experiment
     def close(self, experiment):
-        experiment.lock.close()
+        experiment.close()
+
+    @contextmanager
+    def temporary_directory(self):
+        # Resource callbacks run BEFORE TemporaryDirectory removes files. On
+        # NFS an unclosed .training.lock becomes a .nfs file and can replace the
+        # useful optimizer/assertion error with a Directory-not-empty error.
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as resources:
+            previous = getattr(self, 'directory_resources', None)
+            self.directory_resources = resources
+            try:
+                yield directory
+            finally:
+                self.directory_resources = previous
 
     def test_one_optimizer_update_per_arm_has_finite_nonzero_adapter_gradient(self):
         for arm in ('root', 'entropy_cf', 'r_cf', 'gradient_ce_cf'):
-            with self.subTest(arm=arm), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(arm=arm), self.temporary_directory() as directory:
                 experiment = self.create(directory, arm)
                 before = {name: value.clone() for name, value in experiment.model.state_dict().items()}
                 self.assertEqual(experiment.run(), 0)
@@ -157,9 +177,70 @@ class TrainingTests(unittest.TestCase):
                     self.assertTrue(all(len(item['keep']) == 4 and len(item['alternative']) == 8 for item in cf))
                 self.close(experiment)
 
+    def test_cpu_optimizer_never_queries_the_actual_cuda_driver(self):
+        with self.temporary_directory() as directory:
+            experiment = self.create(directory)
+            # Simulate a Linux CUDA-enabled torch wheel on a login node whose
+            # driver is absent/old. These synthetic parameters are all CPU-only.
+            with patch('torch.backends.cuda.is_built', return_value=True), \
+                 patch('torch.cuda.graphs._cuda_isCurrentStreamCapturing', create=True,
+                       side_effect=RuntimeError('real CUDA driver must not be touched')) as native_query:
+                self.assertEqual(experiment.run(), 0)
+                self.assertTrue(torch.cuda.is_current_stream_capturing.called)
+                native_query.assert_not_called()
+
+    def test_training_exception_closes_lock_before_nfs_style_directory_cleanup(self):
+        experiment = None
+        original_rmtree = shutil.rmtree
+        def nfs_rmtree(path, *args, **kwargs):
+            # NFS retains an unlinked open lock as .nfs*, so deleting its parent
+            # fails. Simulate that rule while preserving ordinary cleanup.
+            if experiment is not None and not experiment.lock.closed:
+                raise OSError(errno.ENOTEMPTY, 'open .nfs lock file', str(path))
+            return original_rmtree(path, *args, **kwargs)
+        with patch('tempfile._shutil.rmtree', side_effect=nfs_rmtree):
+            with self.assertRaisesRegex(RuntimeError, 'primary optimizer failure'):
+                with self.temporary_directory() as directory:
+                    experiment = self.create(directory)
+                    experiment.collect_prompt = Mock(side_effect=RuntimeError('primary optimizer failure'))
+                    experiment.run()
+        self.assertTrue(experiment.lock.closed)
+        self.assertEqual(experiment.tracker.finished_exit_code, 1)
+
+    def test_initialization_failure_closes_lock_and_started_tracker(self):
+        handles, trackers = [], []
+        original_open = Path.open
+        def track_open(path, *args, **kwargs):
+            handle = original_open(path, *args, **kwargs)
+            if path.name == '.training.lock':
+                handles.append(handle)
+            return handle
+        def tracker(*args, **kwargs):
+            result = FakeTracker(*args, **kwargs)
+            trackers.append(result)
+            return result
+        with self.temporary_directory() as directory:
+            with patch.object(Path, 'open', track_open), \
+                 patch('hindsight_grpo.train.Tracker', side_effect=tracker), \
+                 patch('hindsight_grpo.train.load_model', side_effect=RuntimeError('model load failure')):
+                with self.assertRaisesRegex(RuntimeError, 'model load failure'):
+                    self.create(directory)
+            self.assertTrue(handles and all(handle.closed for handle in handles))
+            self.assertEqual(trackers[0].finished_exit_code, 1)
+
+    def test_shutdown_error_preserves_primary_error_and_releases_lock(self):
+        with self.temporary_directory() as directory:
+            experiment = self.create(directory)
+            experiment.tracker.finish = Mock(side_effect=RuntimeError('tracker shutdown failure'))
+            with self.assertRaisesRegex(ValueError, 'primary training failure') as caught:
+                with experiment:
+                    raise ValueError('primary training failure')
+            self.assertTrue(experiment.lock.closed)
+            self.assertIn('RuntimeError', caught.exception.__notes__[0])
+
     def test_partial_accumulation_resume_matches_uninterrupted_all_arms(self):
         for arm in ('root', 'entropy_cf', 'r_cf', 'gradient_ce_cf'):
-            with self.subTest(arm=arm), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(arm=arm), self.temporary_directory() as directory:
                 direct = self.create(Path(directory) / 'direct', arm)
                 self.assertEqual(direct.run(), 0)
                 expected = {name: value.clone() for name, value in direct.model.state_dict().items()}
@@ -188,7 +269,7 @@ class TrainingTests(unittest.TestCase):
     def test_cf_gradient_averages_only_valid_states(self):
         # Inject one known auxiliary-gradient sum for a four-prompt batch. It
         # must contribute /1 valid state, rather than /4 training prompts.
-        with tempfile.TemporaryDirectory() as directory:
+        with self.temporary_directory() as directory:
             experiment = self.create(directory, 'entropy_cf')
             experiment.config['max_grad_norm'] = 100.
             initial = experiment.model.adapter.weight.detach().clone()
@@ -210,7 +291,7 @@ class TrainingTests(unittest.TestCase):
     def test_three_epochs_flush_short_batches_without_repeating_prompts(self):
         # Six examples exercise a four-prompt update plus a two-prompt tail,
         # matching the official split's remainder without 1,122 real rollouts.
-        with tempfile.TemporaryDirectory() as directory:
+        with self.temporary_directory() as directory:
             experiment = self.create(directory, verify=False)
             experiment.config['epochs'] = 3
             experiment.config['validation_every_updates'] = 999
@@ -236,7 +317,7 @@ class TrainingTests(unittest.TestCase):
             self.close(experiment)
 
     def test_signal_during_best_evaluation_preserves_final_weights(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with self.temporary_directory() as directory:
             experiment = self.create(directory, verify=False)
             experiment.progress.update(epoch=experiment.config['epochs'], update=1,
                 baseline_done=True, validated_update=1, final_test_done=True,
@@ -259,7 +340,7 @@ class TrainingTests(unittest.TestCase):
             self.close(experiment)
 
     def test_verification_resume_after_update_does_not_consume_extra_prompt(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with self.temporary_directory() as directory:
             original = self.create(directory)
             self.assertEqual(original.run(), 0)
             self.close(original)
@@ -273,7 +354,7 @@ class TrainingTests(unittest.TestCase):
             self.close(resumed)
 
     def test_complete_training_evaluates_baseline_final_best_and_uploads_plots(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with self.temporary_directory() as directory:
             experiment = self.create(directory, verify=False)
             plots = Mock(return_value=[])
             with patch.dict('sys.modules', {'hindsight_grpo.plots': SimpleNamespace(make_plots=plots)}):
@@ -295,7 +376,7 @@ class TrainingTests(unittest.TestCase):
             self.close(experiment)
 
     def test_failure_record_redacts_credentials_and_raises(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with self.temporary_directory() as directory:
             experiment = self.create(directory)
             def fail(*args):
                 raise RuntimeError('synthetic failure containing dummy-not-real')

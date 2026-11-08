@@ -1,7 +1,9 @@
-"""Choose the actual partition/QoS maximum, with explicit override if unlimited."""
+"""Respect the user's 48-hour ceiling, stricter scheduler limits, and shorter overrides."""
 from pathlib import Path
 import os
 import re
+
+MAX_JOB_SECONDS = 48 * 60 * 60
 
 
 def seconds(value):
@@ -28,7 +30,7 @@ def main():
     partition = Path("runtime/preflight/partition-detail.txt").read_text()
     match = re.search(r"\bMaxTime=(\S+)", partition)
     qos = Path("runtime/preflight/qos.txt").read_text().strip().splitlines()
-    limits = [seconds(match.group(1)) if match else None]
+    limits = [MAX_JOB_SECONDS, seconds(match.group(1)) if match else None]
     for line in qos:
         fields = line.split("|")
         if fields[0] == "l40sfree":
@@ -36,8 +38,6 @@ def main():
     if os.environ.get("HINDSIGHT_TIME_LIMIT"):
         limits.append(seconds(os.environ["HINDSIGHT_TIME_LIMIT"]))
     finite = [value for value in limits if value is not None]
-    if not finite:
-        raise SystemExit("No finite SLURM limit found; export HINDSIGHT_TIME_LIMIT explicitly.")
     result = min(finite)
     if result <= 600:
         raise SystemExit("The allocation limit is too short for the 300-second checkpoint warning.")

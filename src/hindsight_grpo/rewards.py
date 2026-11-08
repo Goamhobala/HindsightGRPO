@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import re
 import resource
 import shutil
 import signal
@@ -40,6 +41,52 @@ class SandboxUnavailable(RuntimeError):
     pass
 
 
+REQUIRED_BWRAP_OPTIONS = (
+    "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
+    "--new-session", "--cap-drop", "--clearenv", "--setenv", "--ro-bind",
+    "--proc", "--dev", "--size", "--tmpfs", "--chdir", "--remount-ro",
+)
+
+
+def find_bubblewrap() -> str | None:
+    """Prefer an explicit binary, then the scratch-local build, then the site tool."""
+    override = os.environ.get("HINDSIGHT_BWRAP")
+    if override:
+        return str(Path(override).expanduser().resolve()) if "/" in override else (shutil.which(override) or override)
+    local = Path(__file__).resolve().parents[2] / "runtime" / "bin" / "bwrap"
+    return str(local) if local.is_file() else shutil.which("bwrap")
+
+
+def check_bubblewrap_capabilities(executable: str | None = None) -> dict[str, Any]:
+    """Inspect command support without running any generated code or namespace probe.
+
+    A system binary can exist yet be too old for the required policy. Fail here
+    with the exact missing features, before creating a candidate worker.
+    """
+    executable = executable or find_bubblewrap()
+    remedy = "Run .venv/bin/python scripts/install_bwrap.py on the login node to build the pinned scratch-local binary."
+    if platform.system() != "Linux" or not executable:
+        raise SandboxUnavailable(f"Linux bubblewrap is required; host execution is prohibited. {remedy}")
+    environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    try:
+        help_result = subprocess.run([executable, "--help"], capture_output=True, text=True,
+                                     errors="replace", timeout=10, check=False, env=environment)
+        version_result = subprocess.run([executable, "--version"], capture_output=True, text=True,
+                                        errors="replace", timeout=10, check=False, env=environment)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SandboxUnavailable(f"Cannot inspect bubblewrap at {executable}: {error}. {remedy}") from error
+    help_text = help_result.stdout + help_result.stderr
+    version = (version_result.stdout + version_result.stderr).strip()[:256] or "unknown version"
+    if help_result.returncode:
+        raise SandboxUnavailable(f"Bubblewrap help failed at {executable} ({version}): {help_text[:1024]}. {remedy}")
+    missing = [option for option in REQUIRED_BWRAP_OPTIONS
+               if not re.search(r"(?<![\w-])" + re.escape(option) + r"(?![\w-])", help_text)]
+    if missing:
+        raise SandboxUnavailable(f"Bubblewrap at {executable} ({version}) is missing required options: "
+                                 f"{', '.join(missing)}. {remedy} Sandbox protections remain required.")
+    return {"binary": executable, "version": version, "required_options": list(REQUIRED_BWRAP_OPTIONS)}
+
+
 class RewardRunner:
     """Execute only inside Linux bubblewrap; never fall back to host execution.
 
@@ -56,7 +103,8 @@ class RewardRunner:
         self.require_slurm = require_slurm
         self.temporary_dir = Path(temporary_dir) if temporary_dir else None
         self._verified = False
-        self.bwrap = shutil.which("bwrap")
+        self.bwrap = find_bubblewrap()
+        self._capabilities: dict[str, Any] | None = None
         self.python = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
 
     def _limit_child(self) -> None:
@@ -102,6 +150,7 @@ class RewardRunner:
 
     def check_available(self) -> dict[str, Any]:
         """Exercise the actual namespace/runtime setup using a fixed harmless task."""
+        self._capabilities = check_bubblewrap_capabilities(self.bwrap)
         if self.temporary_dir:
             self.temporary_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="hindsight-sandbox-probe-", dir=self.temporary_dir) as name:
@@ -113,7 +162,8 @@ class RewardRunner:
             raise SandboxUnavailable(f"Bubblewrap preflight failed: {result}")
         self._verified = True
         return {"backend": "bubblewrap", "network": "unshared", "memory_mb": self.memory_mb,
-                "wall_seconds": self.timeout_seconds, "temporary_bytes": 16 * 1024 * 1024}
+                "wall_seconds": self.timeout_seconds, "temporary_bytes": 16 * 1024 * 1024,
+                **self._capabilities}
 
     def _run(self, input_path: Path) -> dict[str, Any]:
         command = self._command(input_path)

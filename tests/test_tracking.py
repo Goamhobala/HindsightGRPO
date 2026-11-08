@@ -86,6 +86,23 @@ class TrackingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Nonfinite'):
             _safe({'score': float('nan')})
 
+    def test_upload_failure_closes_local_files_before_directory_cleanup(self):
+        run = FakeRun()
+        fake = SimpleNamespace(init=lambda **kwargs: run, Settings=lambda **kwargs: kwargs,
+                               Artifact=FakeArtifact)
+        with patch.dict(sys.modules, {'wandb': fake}), patch.dict(os.environ,
+                {'WANDB_API_KEY': 'dummy-not-real', 'WANDB_MODE': 'online'}, clear=True):
+            with tempfile.TemporaryDirectory() as temporary:
+                tracker = Tracker(temporary, 'root', {})
+                tracker.record('records', {'task_id': 1})
+                stream = tracker._files['records']
+                with patch.object(tracker, 'flush_records', side_effect=RuntimeError('upload failed')):
+                    with self.assertRaisesRegex(RuntimeError, 'upload failed'):
+                        tracker.finish(exit_code=1)
+                self.assertTrue(stream.closed)
+                self.assertEqual(tracker._files, {})
+                self.assertEqual(run.finished, {'exit_code': 1})
+
 
 if __name__ == '__main__':
     unittest.main()

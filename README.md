@@ -20,11 +20,11 @@ export WANDB_PROJECT=HindsightGRPO
 bash scripts/submit.sh
 ```
 
-Prerequisites are Git, `uv`, Python 3.11 (or permission for `uv` to provision it), SLURM, and Linux **bubblewrap** with working unprivileged user namespaces and `--size` support. The login node needs Hugging Face/GitHub/PyPI access during setup. Compute nodes need outbound W&B access; model and dataset access use the prefetched scratch cache. Setup runs only static/synthetic checks on the login node. Generated code executes only in isolated workers within a compute allocation.
+Prerequisites are Git, `uv`, Python 3.11 (or permission for `uv` to provision it), SLURM, and Linux with working unprivileged user namespaces. Setup checks the installed **bubblewrap** capabilities. If the site's binary is missing required options such as `--disable-userns`, it builds a pinned compatible copy under `runtime/bin/` without sudo. Building needs `cc`, `make`, `ar`, `ranlib`, and `pkg-config`; the installer reports missing tools. It also builds its own static libcap, so system libcap development headers are unnecessary. The login node needs Hugging Face/GitHub/kernel.org/PyPI access during setup. Compute nodes need outbound W&B access; model and dataset access use the prefetched scratch cache. Setup runs only static/synthetic checks on the login node. Generated code executes only in isolated workers within a compute allocation.
 
 `scripts/env.sh` anchors `../../scratch/yhxjin001/HindsightGRPO` at `$HOME`. It puts caches, Python environments, datasets, temporary files, checkpoints, W&B files, logs, and artifacts under that project's `runtime/`. Do not source an older experiment's environment, which may set `WANDB_MODE=disabled`.
 
-Submission verifies the actual `l40s` partition, `l40sfree` account and QoS, and online W&B authentication. It uses the partition/QoS duration limit and queues four independent jobs, each requesting one GPU. An explicit `HINDSIGHT_TIME_LIMIT` may shorten the scheduler maximum; it does not change the three-epoch schedule. If neither scheduler limit is finite, export a duration explicitly.
+Submission verifies the actual `l40s` partition, `l40sfree` account and QoS, and online W&B authentication. It queues four independent jobs, each requesting one node, one task, one GPU, and eight CPUs. Each job requests up to **48 hours**, reduced if the partition/QoS limit is stricter. An explicit `HINDSIGHT_TIME_LIMIT` can shorten this duration but cannot exceed the 48-hour ceiling; the full three-epoch schedule continues through successor jobs. Memory uses the site's default allocation. SLURM emails all supported job events to `yhxjin001@myuct.ac.za`.
 
 Each job first runs the real-model GPU preflight and a **full-size, one-update verification run** for its arm. Failed checks prevent that arm's full training. Verification has separate checkpoints and W&B runs; full training starts from pretrained weights. Real L40S/BF16, bubblewrap, remote checkpoint loading, and GPU verification updates must pass on the cluster; they have not been claimed as locally verified.
 
@@ -89,6 +89,14 @@ runtime/preflight/<group>/<arm>.json
 Every optimizer update logs root rewards, losses, gradient norms, LR, throughput, and cumulative wall/GPU time. Counterfactual metrics include decision progress, scores, probabilities, keep/alternative means, signed differences, target, auxiliary loss/gradient norm, validity/errors/timeouts. Gradient selection logs every candidate score, CE, full candidate counts, empty-target skips, forward/backward time, and additional peak memory. Detailed records include prompt IDs, tokens, commitment positions/order, block IDs, seeds, and reconstructible masks. JSONL records upload as versioned artifacts at validation/checkpoint publication, interruption, and finish; scalar metrics stream throughout.
 
 Configuration, model/data provenance, checkpoint adapters/optimizer state, evaluation outputs, and plots are W&B artifacts. Standard W&B captures console and system telemetry. Local durable JSONL files remain the audit source. Recovery may replay records written immediately before an uncommitted checkpoint; downstream comparisons should deduplicate by `(arm, epoch, task_id, root_index)` or `(arm, epoch, task_id)` for counterfactual records.
+
+The selected sandbox binary and version are included in preflight records. A local build additionally saves source checksums in `runtime/metadata/bubblewrap.json`. To inspect capabilities without running generated code:
+
+```bash
+.venv/bin/python scripts/install_bwrap.py --check
+```
+
+Selection prefers `HINDSIGHT_BWRAP` when explicitly set, then the project's `runtime/bin/bwrap`, then the system binary. An obsolete system binary does not override the compatible local copy.
 
 Plots show validation accuracy against updates and GPU-hours, root rewards, and counterfactual differences. Each arm refreshes comparisons from available arms at completion; the last finisher includes all arms. To refresh after synchronizing outputs:
 

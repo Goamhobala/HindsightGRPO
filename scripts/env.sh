@@ -7,6 +7,7 @@ if [[ "${HINDSIGHT_LOCAL:-0}" != 1 ]]; then
 else
   cd "$(dirname "${BASH_SOURCE[0]}")/.."
 fi
+export PATH="$PWD/runtime/bin:$PATH"
 export HF_HOME="$PWD/runtime/huggingface"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export HF_MODULES_CACHE="$HF_HOME/modules"
@@ -30,7 +31,7 @@ export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$UV_CACHE_DIR" "$TMPDIR" \
   "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_CONFIG_DIR" \
   "$WANDB_CACHE_DIR" "$HF_MODULES_CACHE" "$XDG_CACHE_HOME" "$TORCH_HOME" \
-  "$MPLCONFIGDIR" runtime/logs runtime/runs runtime/preflight
+  "$MPLCONFIGDIR" runtime/bin runtime/logs runtime/runs runtime/preflight
 if [[ "${WANDB_MODE:-online}" != online && "${WANDB_MODE:-online}" != run ]]; then
   echo 'ERROR: WANDB_MODE must be online for this experiment.' >&2
   return 1

@@ -36,6 +36,18 @@ def average_metrics(records):
 
 class Experiment:
     def __init__(self, config, arm, run_dir, group, verify=False):
+        self.lock = None
+        self.tracker = None
+        self._closed = False
+        try:
+            self._initialize(config, arm, run_dir, group, verify)
+        except BaseException as error:
+            # Initialization can fail after opening the lock or starting W&B.
+            # Release both before a caller removes a temporary run directory.
+            self.__exit__(type(error), error, error.__traceback__)
+            raise
+
+    def _initialize(self, config, arm, run_dir, group, verify=False):
         self.config, self.arm, self.run_dir = config, arm, Path(run_dir)
         self.verify = verify
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -99,6 +111,7 @@ class Experiment:
         provenance = [
             runtime / "metadata" / "inputs_manifest.json",
             runtime / "metadata" / "dataset_manifest.json",
+            runtime / "metadata" / "bubblewrap.json",
             runtime / "installed-requirements.txt",
             runtime / "preflight" / group / f"{arm}.json",
             runtime / "preflight" / "partition.txt",
@@ -111,6 +124,32 @@ class Experiment:
         if provenance:
             self.tracker.artifact(f"{arm}-provenance", provenance, type="provenance")
         self.signals = SignalHandler()
+
+    def close(self, exit_code=0):
+        """Finish tracking and release the run lock, including on failed runs."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self.tracker is not None:
+                self.tracker.finish(exit_code=exit_code)
+        finally:
+            if self.lock is not None and not self.lock.closed:
+                self.lock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception, traceback):
+        try:
+            self.close(exit_code=0 if exception is None else 1)
+        except Exception as cleanup_error:
+            if exception is None:
+                raise
+            # Keep the original training error visible if tracking also fails
+            # during shutdown; the lock is still closed by close()'s finally.
+            exception.add_note(f"Experiment shutdown also failed: {type(cleanup_error).__name__}")
+        return False
 
     @contextmanager
     def timed(self, name):
@@ -427,15 +466,11 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     run_dir = Path(args.run_root) / args.group / ("verification" if args.verify_one_update else "training") / args.arm
-    experiment = Experiment(config, args.arm, run_dir, args.group, args.verify_one_update)
-    code = 1
-    try:
+    with Experiment(config, args.arm, run_dir, args.group, args.verify_one_update) as experiment:
         if experiment.progress.get("complete"):
             code = 0
         else:
             code = experiment.run()
-    finally:
-        experiment.tracker.finish(exit_code=0 if code in (0, 75) else code)
     raise SystemExit(code)
 
 

@@ -72,3 +72,23 @@ The filesystem configuration follows the [official bubblewrap options](https://g
 replacing the bounded temporary filesystem. Nonrecursive `--remount-ro /` leaves
 the separate `/tmp` mount writable while closing writes to the root tmpfs. An
 older bubblewrap or kernel that cannot enforce these settings fails preflight.
+
+## Compatibility with older cluster installations
+
+`scripts/setup.sh` first checks `bwrap --help` and `bwrap --version`. Missing
+options are reported before any worker starts. Setup reuses a capable installed
+binary or builds bubblewrap **0.13.0** and a static libcap **2.75** under
+`runtime/`, using official source archives verified by hard-coded SHA-256 hashes.
+The build uses its own Meson 1.9.1/Ninja 1.13.0 environment, with no sudo or system
+libcap development package required. A C compiler, make, ar, ranlib, and pkg-config
+must be available. No isolation option is dropped to accommodate an older binary.
+
+The build manifest is `runtime/metadata/bubblewrap.json`. Selection prefers the
+explicit `HINDSIGHT_BWRAP` override, then `runtime/bin/bwrap`, then the site's
+binary. `scripts/install_bwrap.py --check` checks capabilities only and is safe
+on the login node; actual namespace/worker execution is still verified in the
+compute allocation. If a compiler/build-tool module is needed, load the site's
+provided tools and rerun setup.
+
+The pinned sources are the [official bubblewrap release](https://github.com/containers/bubblewrap/releases/tag/v0.13.0)
+and [official libcap source archive](https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.75.tar.xz).

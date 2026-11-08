@@ -2,9 +2,13 @@
 #SBATCH --partition=l40s
 #SBATCH --account=l40sfree
 #SBATCH --qos=l40sfree
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=40G
+#SBATCH --time=2-00:00:00
+#SBATCH --mail-user=yhxjin001@myuct.ac.za
+#SBATCH --mail-type=ALL
 #SBATCH --signal=B:USR1@300
 #SBATCH --requeue
 #SBATCH --output=runtime/logs/%x-%j.out
@@ -50,6 +54,7 @@ run_python() {
 }
 report="runtime/preflight/$group/$arm.json"
 mkdir -p "$(dirname "$report")"
+run_python scripts/install_bwrap.py --check
 run_python scripts/gpu_preflight.py --output "$report"
 # One real, full-size optimizer update per arm is a correctness gate, saved in
 # its own W&B group/checkpoint directory. Full training starts from pretrained.

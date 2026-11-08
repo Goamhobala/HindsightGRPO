@@ -2,11 +2,12 @@
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 : "${WANDB_API_KEY:?Export WANDB_API_KEY before submission; its value is never written to the repository.}"
-for command in sbatch sinfo scontrol sacctmgr bwrap; do
+for command in sbatch sinfo scontrol sacctmgr; do
   command -v "$command" >/dev/null || { echo "Missing cluster requirement: $command" >&2; exit 1; }
 done
 [[ -f runtime/metadata/inputs_manifest.json ]] || { echo 'Run bash scripts/setup.sh first.' >&2; exit 1; }
 [[ -f .venv/bin/python ]] || { echo 'Python environment missing.' >&2; exit 1; }
+.venv/bin/python scripts/install_bwrap.py --check
 # Preserve actual resource evidence in scratch. Do not modify the experiment if
 # the expected allocation is unavailable: fail on configuration, queue on load.
 sinfo -p l40s -o '%P %a %l %D %G' > runtime/preflight/partition.txt

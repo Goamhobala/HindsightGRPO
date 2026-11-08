@@ -34,12 +34,29 @@ def test_effective_limit_uses_most_restrictive_evidence(tmp_path, monkeypatch, c
     assert capsys.readouterr().out.strip() == "0-12:00:00"
 
 
-def test_unlimited_evidence_requires_explicit_finite_override(tmp_path, monkeypatch):
+def test_unlimited_evidence_uses_user_48_hour_maximum(tmp_path, monkeypatch, capsys):
     write_evidence(tmp_path, "UNLIMITED", "")
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HINDSIGHT_TIME_LIMIT", raising=False)
-    with pytest.raises(SystemExit, match="No finite SLURM"):
-        time_limit.main()
+    time_limit.main()
+    assert capsys.readouterr().out.strip() == "2-00:00:00"
+
+
+@pytest.mark.parametrize("partition,qos,override,expected", [
+    ("3-00:00:00", "3-00:00:00", None, "2-00:00:00"),
+    ("3-00:00:00", "3-00:00:00", "72:00:00", "2-00:00:00"),
+    ("3-00:00:00", "1-00:00:00", None, "1-00:00:00"),
+    ("3-00:00:00", "3-00:00:00", "12:00:00", "0-12:00:00"),
+])
+def test_user_maximum_scheduler_and_override_limits(tmp_path, monkeypatch, capsys,
+                                                    partition, qos, override, expected):
+    write_evidence(tmp_path, partition, qos)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HINDSIGHT_TIME_LIMIT", raising=False)
+    if override:
+        monkeypatch.setenv("HINDSIGHT_TIME_LIMIT", override)
+    time_limit.main()
+    assert capsys.readouterr().out.strip() == expected
 
 
 def test_too_short_limit_rejected_before_submission(tmp_path, monkeypatch):

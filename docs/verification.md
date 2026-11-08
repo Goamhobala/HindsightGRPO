@@ -38,3 +38,29 @@ Local coverage includes:
 - Evaluation pass@k, per-problem recovery, cache provenance, held-out separation,
   scheduler duration/permission checks, strict online W&B, resume IDs, artifacts,
   and credential redaction.
+
+## HPC portability fixes — 8 November 2026
+
+The supplied cluster traceback exposed a CPU-test fixture that mocked CUDA
+availability but left AdamW's CUDA graph-capture query live. Its driver error
+occurred before lock cleanup, and an NFS directory-removal error masked the
+original exception. Synthetic tests now mock the capture query, and Experiment
+and tracker lifecycles close locks/record files on success, initialization error,
+training error, and failed artifact upload. Regression tests simulate the native
+CUDA query failing and an NFS open-lock cleanup failure.
+
+The cluster's bubblewrap lacks `--disable-userns`. Setup now detects exact
+capabilities and can build SHA-verified bubblewrap 0.13.0 plus static libcap 2.75
+under scratch without sudo. Build-plan/checksum/selection tests are synthetic;
+the actual Linux build and namespace probe remain cluster verification steps.
+
+```text
+.venv/bin/python -m pytest -q
+112 passed, 1 skipped in 24.36s
+
+.venv/bin/python -m pytest tests/test_data_reward.py tests/test_sandbox_capabilities.py -q
+20 passed, 1 skipped in 0.09s
+
+bash -n scripts/env.sh scripts/setup.sh scripts/submit.sh slurm/run.sh
+passed
+```

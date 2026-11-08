@@ -163,8 +163,14 @@ class Tracker:
         self.run.summary.update(_safe(values))
 
     def finish(self, exit_code: int = 0) -> None:
-        self.flush_records()
-        for stream in self._files.values():
-            stream.close()
-        self._files.clear()
-        self.run.finish(exit_code=exit_code)
+        try:
+            self.flush_records()
+        finally:
+            # Failed artifact upload must not leave JSONL descriptors open: an
+            # NFS unlink would otherwise create .nfs files during run cleanup.
+            try:
+                for stream in self._files.values():
+                    stream.close()
+            finally:
+                self._files.clear()
+                self.run.finish(exit_code=exit_code)
