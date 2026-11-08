@@ -1,0 +1,22 @@
+{
+  "model_id": "dllm-hub/Qwen2.5-Coder-0.5B-Instruct-diffusion-mdlm-v0.1",
+  "model_revision": "a284e895a6248256baf2f60502e54aba61b24c1a",
+  "upstream_commit": "ca176752fbceec49c6b4777a2c18ae88e4eb10ed",
+  "dataset_id": "google-research-datasets/mbpp",
+  "dataset_revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+  "generation_length": 256, "denoising_steps": 256, "block_size": 64,
+  "temperature": 0.8, "cfg_scale": 0,
+  "lora_rank": 32, "lora_alpha": 64, "lora_dropout": 0.0,
+  "learning_rate": 0.00002, "adam_betas": [0.9, 0.999], "adam_epsilon": 1e-8,
+  "weight_decay": 0.01, "max_grad_norm": 1.0,
+  "root_trajectories": 8, "prompts_per_update": 4,
+  "keep_continuations": 4, "alternative_continuations": 8,
+  "cf_beta": 4.0, "cf_coefficient": 0.25, "clip_epsilon": 0.2,
+  "epochs": 3, "seed": 20261108,
+  "p_mask_prompt": 0.3, "validation_every_updates": 25,
+  "evaluation_samples": 8,
+  "reward_timeout_seconds": 5, "reward_memory_mb": 512,
+  "wandb_project": "HindsightGRPO", "wandb_entity": null,
+  "likelihood_convention": "upstream_full_completion_mask_seeded_prompt_mask_untempered_token_mean",
+  "epoch_tail": "flush_two_prompts_no_padding"
+}
