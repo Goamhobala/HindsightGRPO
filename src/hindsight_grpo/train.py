@@ -115,6 +115,7 @@ class Experiment:
             runtime / "metadata" / "model_imports.json",
             runtime / "installed-requirements.txt",
             runtime / "preflight" / group / f"{arm}.json",
+            runtime / "preflight" / group / f"{arm}-sandbox.json",
             runtime / "preflight" / "partition.txt",
             runtime / "preflight" / "partition-detail.txt",
             runtime / "preflight" / "association.txt",

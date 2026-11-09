@@ -10,6 +10,7 @@ import builtins
 import io
 import json
 import os
+import resource
 import sys
 
 
@@ -21,7 +22,22 @@ class DiscardOutput(io.TextIOBase):
         return None
 
 
+def limit_processes():
+    """Apply the candidate's hard cap after bubblewrap has created namespaces.
+
+    Applying RLIMIT_NPROC to the launcher would count the training user's host
+    threads during clone(), preventing namespace startup before code can run.
+    Never raise an inherited account limit, even when it is stricter than 32.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    finite = [value for value in (soft, hard) if value != resource.RLIM_INFINITY]
+    limit = min([32, *finite])
+    resource.setrlimit(resource.RLIMIT_NPROC, (limit, limit))
+    return limit
+
+
 def main():
+    process_limit = limit_processes()
     with open(sys.argv[1], encoding="utf-8") as handle:
         payload = json.load(handle)
     # Capture helpers and test bytecode before executing untrusted Python. Keep
@@ -64,7 +80,8 @@ def main():
     # Avoid mutable global serializers and sys.stdout after candidate execution.
     result = (b'{"tests_passed":' + stringify(passed).encode("ascii")
               + b',"test_errors":[' + b",".join(error_bytes)
-              + b'],"error":' + first_error + b',"timeout":false}\n')
+              + b'],"error":' + first_error + b',"timeout":false,"process_limit":'
+              + stringify(process_limit).encode("ascii") + b'}\n')
     write_result(result_fd, result)
 
 

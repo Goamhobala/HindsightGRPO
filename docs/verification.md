@@ -87,3 +87,31 @@ now run the same small CPU architecture check before queueing GPU jobs.
 
 This uses small random CPU weights in the actual architecture. Full pretrained
 0.5B weight loading and BF16 remain the compute-node GPU preflight.
+
+## Namespace startup/process-limit fix — 9 November 2026
+
+The cluster reported bubblewrap's initial namespace clone failing with
+`Resource temporarily unavailable` (`EAGAIN`). The launcher incorrectly lowered
+`RLIMIT_NPROC` to 32 before namespace creation, where Linux counts the training
+UID's PyTorch/W&B threads as well. That bug can explain the startup failure;
+an inherited account or cgroup limit remains an alternative until checked on
+the actual node.
+
+The launcher now retains site process limits. The worker immediately lowers its
+own soft/hard process limits to at most 32 before reading candidate input,
+preserving any stricter inherited cap. Regression cases cover placement, limit
+values, failure before candidate execution, and diagnostic reporting. Other
+isolation/resource controls remain unchanged.
+
+`scripts/check_sandbox.py` now provides a standalone compute-allocation probe
+and runs before model loading in scheduled jobs. It records accessible process,
+thread, cgroup PID, and namespace-limit evidence for real-node failures. Local
+Docker's daemon was unavailable; no Linux namespace execution is claimed here.
+
+```text
+.venv/bin/python -m pytest -q
+131 passed, 1 skipped in 30.42s
+
+bash -n scripts/env.sh scripts/setup.sh scripts/submit.sh slurm/run.sh
+passed
+```

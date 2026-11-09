@@ -41,6 +41,69 @@ class SandboxUnavailable(RuntimeError):
     pass
 
 
+def sandbox_diagnostics() -> dict[str, Any]:
+    """Read resource evidence without changing account limits or collecting env."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    result: dict[str, Any] = {"uid": os.getuid(),
+        "launcher_nproc_soft": soft, "launcher_nproc_hard": hard,
+        "worker_process_cap": 32}
+    proc = Path("/proc")
+    processes = threads = 0
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            status = (entry / "status").read_text()
+            uid = re.search(r"^Uid:\s+(\d+)", status, re.MULTILINE)
+            count = re.search(r"^Threads:\s+(\d+)", status, re.MULTILINE)
+            if uid and int(uid[1]) == result["uid"]:
+                processes += 1
+                threads += int(count[1]) if count else 1
+        except OSError:
+            continue
+    result["visible_uid_processes"] = processes
+    result["visible_uid_threads"] = threads
+    for name in ("max_user_namespaces", "max_pid_namespaces", "max_mnt_namespaces"):
+        try:
+            result[name] = (proc / "sys/user" / name).read_text().strip()[:64]
+        except OSError:
+            pass
+    # Report v1/v2 pids controllers and ancestors, since an ancestor limit may
+    # deny clone() even if the job's own pids.max is unlimited.
+    controllers = []
+    try:
+        groups = (proc / "self/cgroup").read_text().splitlines()
+    except OSError:
+        groups = []
+    for group in groups:
+        fields = group.split(":", 2)
+        if len(fields) != 3 or ".." in Path(fields[2]).parts:
+            continue
+        if fields[0] == "0" and not fields[1]:
+            base = Path("/sys/fs/cgroup")
+        elif "pids" in fields[1].split(","):
+            base = Path("/sys/fs/cgroup/pids")
+        else:
+            continue
+        current = base / fields[2].lstrip("/")
+        for _ in range(16):
+            try:
+                controllers.append({"path": str(current),
+                    "current": (current / "pids.current").read_text().strip()[:64],
+                    "max": (current / "pids.max").read_text().strip()[:64]})
+            except OSError:
+                pass
+            if current == base or base not in current.parents:
+                break
+            current = current.parent
+    result["cgroup_pids"] = controllers
+    return result
+
+
 REQUIRED_BWRAP_OPTIONS = (
     "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
     "--new-session", "--cap-drop", "--clearenv", "--setenv", "--ro-bind",
@@ -114,7 +177,8 @@ class RewardRunner:
         resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
         resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536))
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-        resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
+        # Keep the site's inherited process limit for trusted bwrap startup.
+        # The worker applies the hard 32-process cap before executing any code.
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         os.umask(0o077)
 
@@ -163,6 +227,7 @@ class RewardRunner:
         self._verified = True
         return {"backend": "bubblewrap", "network": "unshared", "memory_mb": self.memory_mb,
                 "wall_seconds": self.timeout_seconds, "temporary_bytes": 16 * 1024 * 1024,
+                "worker_process_cap": result.get("process_limit", 32),
                 **self._capabilities}
 
     def _run(self, input_path: Path) -> dict[str, Any]:
@@ -170,9 +235,13 @@ class RewardRunner:
         # Regular files bound output size; capture_output pipes do not honour
         # RLIMIT_FSIZE and could consume unbounded memory before timeout.
         with tempfile.TemporaryFile(mode="w+b") as output, tempfile.TemporaryFile(mode="w+b") as errors:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
-                                       env={"PATH": "/usr/bin:/bin"}, start_new_session=True,
-                                       preexec_fn=self._limit_child)
+            try:
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
+                                           env={"PATH": "/usr/bin:/bin"}, start_new_session=True,
+                                           preexec_fn=self._limit_child)
+            except OSError as error:
+                raise SandboxUnavailable(f"Cannot launch the reward sandbox: {error}. "
+                    f"Resource diagnostics: {json.dumps(sandbox_diagnostics(), sort_keys=True)}") from error
             try:
                 returncode = process.wait(timeout=self.timeout_seconds + 1)
             except subprocess.TimeoutExpired:
@@ -185,7 +254,11 @@ class RewardRunner:
             stderr = errors.read(4096).decode(errors="replace")
             if returncode != 0:
                 if stderr.lstrip().startswith("bwrap:"):
-                    raise SandboxUnavailable(f"Bubblewrap infrastructure failed: {stderr}")
+                    evidence = json.dumps(sandbox_diagnostics(), sort_keys=True)
+                    raise SandboxUnavailable(f"Bubblewrap infrastructure failed: {stderr.strip()}. "
+                        "The launcher retains the account process limit; the 32-process cap is applied "
+                        "inside the worker. Check UID/cgroup task limits and namespace policy. "
+                        f"Resource diagnostics: {evidence}")
                 timeout = returncode in (-signal.SIGXCPU, -signal.SIGKILL, 128 + signal.SIGXCPU)
                 return {"error": f"sandbox_exit_{returncode}: {stderr}", "timeout": timeout,
                         "tests_passed": 0}

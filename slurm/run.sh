@@ -55,6 +55,7 @@ run_python() {
 report="runtime/preflight/$group/$arm.json"
 mkdir -p "$(dirname "$report")"
 run_python scripts/install_bwrap.py --check
+run_python scripts/check_sandbox.py --output "runtime/preflight/$group/$arm-sandbox.json"
 run_python scripts/gpu_preflight.py --output "$report"
 # One real, full-size optimizer update per arm is a correctness gate, saved in
 # its own W&B group/checkpoint directory. Full training starts from pretrained.

@@ -46,6 +46,22 @@ sandbox configuration. The full test process receives:
 - 512 MiB address-space limit, 5 CPU seconds, a hard 6-second wall timeout,
   64 file descriptors, 32 processes, 64 KiB output-file limit, and no core dumps.
 
+The process cap is set as the worker's first operation, before opening the task
+payload or compiling/executing generated code. It lowers both soft and hard
+`RLIMIT_NPROC` to at most 32 and preserves stricter inherited limits. The trusted
+bubblewrap launcher retains the site's inherited process limits while creating
+namespaces. Linux counts real-UID threads for this limit; capping the launcher at
+32 can make its initial `clone()` fail after PyTorch/W&B have started threads,
+even though no generated program is running. See the [Linux resource-limit
+documentation](https://man7.org/linux/man-pages/man2/getrlimit.2.html).
+
+Namespace-startup errors include read-only task/cgroup/namespace diagnostics.
+The standalone compute-allocation probe is `scripts/check_sandbox.py`; it runs
+before model loading in every scheduled job. A remaining `EAGAIN` can also come
+from the site's inherited limits or a [cgroup PID limit](https://docs.kernel.org/admin-guide/cgroup-v2.html#pid),
+so diagnostics are reported rather than assigning zero reward or falling back
+to host execution.
+
 Each test executes with a fresh globals namespace. Normal candidate stdout and
 stderr are discarded. The parent bounds all process output with regular files
 and parses structured results. A crash, malformed output, resource-limit exit,

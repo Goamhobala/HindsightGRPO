@@ -26,7 +26,7 @@ Prerequisites are Git, `uv`, Python 3.11 (or permission for `uv` to provision it
 
 Submission verifies the actual `l40s` partition, `l40sfree` account and QoS, and online W&B authentication. It queues four independent jobs, each requesting one node, one task, one GPU, and eight CPUs. Each job requests up to **48 hours**, reduced if the partition/QoS limit is stricter. An explicit `HINDSIGHT_TIME_LIMIT` can shorten this duration but cannot exceed the 48-hour ceiling; the full three-epoch schedule continues through successor jobs. Memory uses the site's default allocation. SLURM emails all supported job events to `yhxjin001@myuct.ac.za`.
 
-Each job first runs the real-model GPU preflight and a **full-size, one-update verification run** for its arm. Failed checks prevent that arm's full training. Verification has separate checkpoints and W&B runs; full training starts from pretrained weights. Real L40S/BF16, bubblewrap, remote checkpoint loading, and GPU verification updates must pass on the cluster; they have not been claimed as locally verified.
+Each job first probes actual reward-sandbox execution before loading model weights, then runs the real-model GPU preflight and a **full-size, one-update verification run** for its arm. Failed checks prevent that arm's full training. Verification has separate checkpoints and W&B runs; full training starts from pretrained weights. Real L40S/BF16, bubblewrap, remote checkpoint loading, and GPU verification updates must pass on the cluster; they have not been claimed as locally verified.
 
 ## Fixed protocol
 
@@ -99,6 +99,14 @@ The selected sandbox binary and version are included in preflight records. A loc
 ```
 
 Selection prefers `HINDSIGHT_BWRAP` when explicitly set, then the project's `runtime/bin/bwrap`, then the system binary. An obsolete system binary does not override the compatible local copy.
+
+To test actual namespace creation on its own **inside a SLURM compute allocation**:
+
+```bash
+.venv/bin/python scripts/check_sandbox.py
+```
+
+Failures save UID/thread counts, inherited process limits, available namespace-limit settings, and readable cgroup PID limits in `runtime/preflight/sandbox.json`. Scheduled jobs save per-arm reports under `runtime/preflight/<group>/<arm>-sandbox.json`. The generated-code process cap is applied inside the worker after namespace creation; applying it to the launcher can incorrectly count PyTorch/W&B threads across the user's jobs.
 
 Plots show validation accuracy against updates and GPU-hours, root rewards, and counterfactual differences. Each arm refreshes comparisons from available arms at completion; the last finisher includes all arms. To refresh after synchronizing outputs:
 
