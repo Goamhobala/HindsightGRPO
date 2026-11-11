@@ -162,6 +162,15 @@ class Tracker:
     def summary(self, values: dict[str, Any]) -> None:
         self.run.summary.update(_safe(values))
 
+    def progress(self, values: dict[str, Any], step: int) -> None:
+        """Small live status updates, including work between optimizer updates."""
+        values = _safe({**values, "progress/updated_unix": time.time(),
+                        "scheduler/job_id": os.environ.get("SLURM_JOB_ID", "")})
+        atomic_json(self.run_dir / "progress.json", values)
+        self.record("progress", values, step)
+        self.summary(values)
+        print(json.dumps({"arm": self.arm, "update": step, **values}, sort_keys=True), flush=True)
+
     def finish(self, exit_code: int = 0) -> None:
         try:
             self.flush_records()

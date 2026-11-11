@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import copy
+from dataclasses import asdict
 import fcntl
 import json
 import math
@@ -16,9 +17,10 @@ import numpy as np
 import torch
 
 from .checkpoint import SignalHandler, atomic_json, load_checkpoint, save_checkpoint
+from .budget import RunBudget
 from .config import ARMS, config_digest, load_config, stable_seed
 from .data import completion_text, implementation_token_mask, load_mbpp, prompt_for
-from .evaluation import StopRequested, evaluate
+from .evaluation import BudgetExpired, StopRequested, evaluate
 from .model import frozen_snapshot, load_model, root_logps, selected_token_logp
 from .objectives import cf_loss, cf_target, clipped_root_loss, root_advantages
 from .rewards import RewardRunner
@@ -50,6 +52,9 @@ class Experiment:
     def _initialize(self, config, arm, run_dir, group, verify=False):
         self.config, self.arm, self.run_dir = config, arm, Path(run_dir)
         self.verify = verify
+        budget_path = self.run_dir.parent.parent / "run_budget.json"
+        self.budget = RunBudget.load(budget_path) if not verify and budget_path.exists() else None
+        self.phase = "initializing"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.lock = (self.run_dir / ".training.lock").open("w")
         try:
@@ -95,6 +100,14 @@ class Experiment:
             self.progress = restored["progress"]
             if self.progress["wandb_run_id"] != self.tracker.run_id:
                 raise RuntimeError("Resume W&B run identity mismatch")
+        saved_budget = self.progress.get("run_budget")
+        active_budget = asdict(self.budget) if self.budget else None
+        if saved_budget is not None and saved_budget != active_budget:
+            raise RuntimeError("Resume requires the same saved run budget and deadlines")
+        if self.budget:
+            if self.progress["prompts_processed"] > self.budget.training_prompts:
+                raise RuntimeError("Checkpoint already exceeds the training cutoff; cannot undo updates")
+            self.progress["run_budget"] = active_budget
         self.previous_wall = self.progress["wall_seconds"]
         self.rollout = frozen_snapshot(self.model)
         self.sampler = Sampler(self.rollout, self.tokenizer,
@@ -105,6 +118,22 @@ class Experiment:
         self.tracker.record("preflight", self.reward.check_available(), self.progress["update"])
         self.data = load_mbpp(cache_dir=Path(os.environ.get("HF_DATASETS_CACHE", "runtime/datasets")),
                               manifest_path=self.run_dir / "dataset_manifest.json")
+        if self.budget:
+            if self.budget.training_prompts > len(self.data["train"]):
+                raise ValueError("Training cutoff exceeds one pass through the training split")
+            self.test_rows = self.budget.test_rows(self.data["test"], config["seed"])
+            order = list(range(len(self.data["train"])))
+            random.Random(stable_seed(config["seed"], "training-order", 0)).shuffle(order)
+            budget_manifest = {"budget": active_budget,
+                "training_task_ids": [self.data["train"][i]["task_id"]
+                                      for i in order[:self.budget.training_prompts]],
+                "test_task_ids": [row["task_id"] for row in self.test_rows],
+                "validation": "full split, final checkpoint only", "best_test": False}
+            manifest_path = self.run_dir / "run_budget.json"
+            if manifest_path.exists() and json.loads(manifest_path.read_text()) != budget_manifest:
+                raise RuntimeError("Saved budget/task selection differs from the active plan")
+            atomic_json(manifest_path, budget_manifest)
+            self.tracker.artifact(f"{arm}-run-budget", manifest_path, type="protocol")
         self.tracker.artifact(f"{arm}-dataset", self.run_dir / "dataset_manifest.json", type="dataset-metadata")
         project = Path(__file__).resolve().parents[2]
         runtime = project / "runtime"
@@ -126,6 +155,7 @@ class Experiment:
         if provenance:
             self.tracker.artifact(f"{arm}-provenance", provenance, type="provenance")
         self.signals = SignalHandler()
+        self.publish_progress("ready")
 
     def close(self, exit_code=0):
         """Finish tracking and release the run lock, including on failed runs."""
@@ -172,6 +202,43 @@ class Experiment:
         if upload:
             self.tracker.artifact(f"{self.arm}-checkpoint", path, type="model", aliases=[name])
             self.tracker.flush_records()
+        self.publish_progress(self.phase, **{"checkpoint/prompts_processed": self.progress["prompts_processed"],
+            "checkpoint/update": self.progress["update"], "checkpoint/saved_unix": time.time()})
+
+    def publish_progress(self, phase, **extra):
+        self.phase = phase
+        p, c = self.progress, self.config
+        total = (self.budget.training_prompts if self.budget else
+                 c["prompts_per_update"] if self.verify else len(self.data["train"]) * c["epochs"])
+        updates = (total // c["prompts_per_update"] if self.budget or self.verify else
+                   math.ceil(len(self.data["train"]) / c["prompts_per_update"]) * c["epochs"])
+        values = {"progress/phase": phase, "progress/training_prompts_completed": p["prompts_processed"],
+            "progress/training_prompts_total": total, "progress/updates_completed": p["update"],
+            "progress/updates_total": updates, "latest_update": p["update"],
+            "progress/partial_batch_prompts": p["accumulation_count"], **extra}
+        if phase == "training" and p["prompts_processed"]:
+            training_seconds = sum(value for key, value in p["costs"].items()
+                                   if key not in ("evaluation_seconds", "plotting_seconds"))
+            values["progress/training_eta_seconds"] = (max(0, total - p["prompts_processed"])
+                * training_seconds / p["prompts_processed"])
+        if self.budget:
+            values.update({"protocol/budget": self.budget.label,
+                "protocol/test_problems": self.budget.test_problems,
+                "budget/training_deadline_unix": self.budget.training_deadline_unix,
+                "budget/deadline_unix": self.budget.deadline_unix})
+        self.tracker.progress(values, p["update"])
+
+    def training_cutoff_reached(self):
+        if not self.budget:
+            return False
+        p = self.progress
+        if p["prompts_processed"] >= self.budget.training_prompts:
+            p["training_stop_reason"] = "prompt_cutoff"
+            return True
+        if p["accumulation_count"] == 0 and time.time() >= self.budget.training_deadline_unix:
+            p["training_stop_reason"] = "training_deadline"
+            return True
+        return False
 
     def sync_rollout(self):
         self.rollout.load_state_dict(self.model.state_dict())
@@ -295,12 +362,16 @@ class Experiment:
         metrics["loss/total"] = metrics["loss/root"] + c["cf_coefficient"] * metrics.get("loss/counterfactual", 0.)
         return metrics
 
-    def evaluate(self, label, split):
+    def evaluate(self, label, split, cache_source=None, checkpoint_id=None):
         # Snapshot includes the just-updated LoRA weights; all decoding is ordinary.
         self.sync_rollout()
         with self.timed("evaluation_seconds"):
-            result = evaluate(self.sampler, self.tokenizer, self.reward, self.data[split], split,
-                label, self.config, self.run_dir, self.tracker, self.progress["update"], self.signals)
+            rows = self.test_rows if self.budget and split == "test" else self.data[split]
+            result = evaluate(self.sampler, self.tokenizer, self.reward, rows, split,
+                label, self.config, self.run_dir, self.tracker, self.progress["update"], self.signals,
+                checkpoint_id=checkpoint_id, cache_source=cache_source,
+                progress_callback=lambda values: self.publish_progress("evaluation", **values),
+                deadline_unix=self.budget.deadline_unix if self.budget else None)
         wall = self.previous_wall + time.monotonic() - self.started
         metrics = {"compute/wall_seconds": wall, "compute/gpu_hours": wall / 3600,
             **{f"cost/{key}": value for key, value in self.progress["costs"].items()}}
@@ -338,21 +409,44 @@ class Experiment:
                 if self.verify and p["update"] >= 1:
                     self.mark_verification_passed()
                     return 0
-                if not self.verify and not p["baseline_done"]:
+                if self.budget and not p.get("budget_baseline_done"):
+                    # Existing trained arms must reuse their original baseline.
+                    # Missing caches cannot be regenerated with trained weights.
+                    if p["update"]:
+                        missing = [row["task_id"] for row in self.test_rows
+                                   if not (self.run_dir / "evaluation" / "pretrained" / "test"
+                                           / f"{row['task_id']}.json").exists()]
+                        if missing:
+                            raise RuntimeError("Pretrained baseline cache missing for a trained arm")
+                    if not p["baseline_done"]:
+                        self.evaluate("pretrained", "validation")
+                    self.evaluate(f"{self.budget.label}-pretrained", "test",
+                                  cache_source="pretrained", checkpoint_id="pretrained")
+                    p["baseline_done"] = p["budget_baseline_done"] = True
+                    self.checkpoint()
+                elif not self.verify and not p["baseline_done"]:
                     self.evaluate("pretrained", "validation")
                     self.evaluate("pretrained", "test")
                     p["baseline_done"] = True
                     self.checkpoint()
                 for epoch in range(p["epoch"], c["epochs"]):
+                    if self.training_cutoff_reached():
+                        break
                     p["epoch"] = epoch
                     order = list(range(len(self.data["train"])))
                     random.Random(stable_seed(c["seed"], "training-order", epoch)).shuffle(order)
                     # Resumed checkpoint at optimizer boundary may still need validation.
-                    if not self.verify and p["update"] and p["update"] % c["validation_every_updates"] == 0 and p["validated_update"] != p["update"]:
+                    if not self.verify and not self.budget and p["update"] and p["update"] % c["validation_every_updates"] == 0 and p["validated_update"] != p["update"]:
                         self.validate()
                     while p["cursor"] < len(order):
+                        if self.budget and time.time() >= self.budget.deadline_unix:
+                            raise BudgetExpired()
+                        if self.training_cutoff_reached():
+                            break
                         if self.signals.requested:
                             raise StopRequested()
+                        self.publish_progress("training", **{"progress/task_id":
+                            self.data["train"][order[p["cursor"]]]["task_id"]})
                         if p["accumulation_count"] == 0:
                             self.sync_rollout()
                             self.optimizer.zero_grad(set_to_none=True)
@@ -402,8 +496,10 @@ class Experiment:
                         if self.verify and p["update"] >= 1:
                             self.mark_verification_passed()
                             return 0
-                        if not self.verify and p["accumulation_count"] == 0 and p["update"] % c["validation_every_updates"] == 0:
+                        if not self.verify and not self.budget and p["accumulation_count"] == 0 and p["update"] % c["validation_every_updates"] == 0:
                             self.validate()
+                    if self.training_cutoff_reached():
+                        break
                     p["epoch"], p["cursor"] = epoch + 1, 0
                     self.checkpoint()
                 if not self.verify:
@@ -411,10 +507,10 @@ class Experiment:
                         self.validate()
                     self.checkpoint("final", upload=True)
                     if not p["final_test_done"]:
-                        self.evaluate("final", "test")
+                        self.evaluate(f"{self.budget.label}-final" if self.budget else "final", "test")
                         p["final_test_done"] = True
                         self.checkpoint()
-                    if not p["best_test_done"]:
+                    if not self.budget and not p["best_test_done"]:
                         # Keep final/optimizer resume state separate from best evaluation.
                         try:
                             load_checkpoint(self.run_dir / "checkpoints" / "best.pt", self.model,
@@ -440,10 +536,20 @@ class Experiment:
                         "optimizer_updates": p["update"], "best_validation": p["best_validation"],
                         **final_costs})
                     atomic_json(self.run_dir / "complete.json", {"arm": self.arm, "updates": p["update"],
-                                "prompts": p["prompts_processed"], "wandb_url": self.tracker.url})
+                                "prompts": p["prompts_processed"], "wandb_url": self.tracker.url,
+                                "budget": asdict(self.budget) if self.budget else None,
+                                "training_stop_reason": p.get("training_stop_reason", "full_schedule")})
+                    self.publish_progress("complete")
+                return 0
+            except BudgetExpired:
+                p["budget_exhausted"] = True
+                self.checkpoint(upload=True)
+                self.publish_progress("budget_exhausted")
+                self.tracker.summary({"complete": False, "budget_exhausted": True})
                 return 0
             except StopRequested:
                 self.checkpoint(upload=True)
+                self.publish_progress("paused")
                 return 75
             except Exception as error:
                 message = str(error)

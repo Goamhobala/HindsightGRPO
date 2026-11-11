@@ -7,6 +7,7 @@ import errno
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -14,6 +15,8 @@ from unittest.mock import Mock, patch
 import torch
 
 from hindsight_grpo.checkpoint import atomic_json, load_checkpoint, save_checkpoint
+from hindsight_grpo.budget import RunBudget
+from hindsight_grpo.config import stable_seed
 from hindsight_grpo.evaluation import StopRequested
 from hindsight_grpo.model import ModelBundle
 from hindsight_grpo.train import Experiment
@@ -93,6 +96,8 @@ class FakeTracker:
         pass
     def summary(self, value):
         self.final_summary = value
+    def progress(self, values, step):
+        atomic_json(self.run_dir / 'progress.json', values)
     def finish(self, exit_code=0):
         self.finished_exit_code = exit_code
 
@@ -389,6 +394,110 @@ class TrainingTests(unittest.TestCase):
             self.assertNotIn('dummy-not-real', errors[0]['message'])
             self.assertIn('[redacted]', errors[0]['message'])
             self.close(experiment)
+
+
+    def activate_budget(self, run_dir, expired=False):
+        now = time.time()
+        budget = RunBudget(4, 1, now - 7200 if expired else now,
+            now - 3600 if expired else now + 3600,
+            now - 1 if expired else now + 7200)
+        atomic_json(Path(run_dir).parent.parent / 'run_budget.json', asdict(budget))
+        return budget
+
+    def test_budget_caps_original_shuffled_order_without_starting_another_epoch(self):
+        import random
+        def six_rows(**kwargs):
+            data = fake_data(**kwargs)
+            data['train'] = [{'task_id': i} for i in range(6)]
+            return data
+        with self.temporary_directory() as directory:
+            run = Path(directory) / 'group/training/root'
+            self.activate_budget(run)
+            with patch('hindsight_grpo.train.load_mbpp', six_rows):
+                experiment = self.create(run, verify=False)
+            experiment.progress.update(baseline_done=True, budget_baseline_done=True)
+            seen, evaluations = [], []
+            def collect(row, denominator):
+                seen.append(row['task_id'])
+                self.assertEqual(denominator, 4)
+                loss = experiment.model.adapter.weight.square().mean()
+                (loss / denominator).backward()
+                return {'loss/root': float(loss.detach())}
+            experiment.collect_prompt = collect
+            def evaluate(label, split):
+                evaluations.append((label, split))
+                return {'accuracy': .5, 'pass_at_1': .5}
+            experiment.evaluate = evaluate
+            with patch('hindsight_grpo.plots.make_plots', return_value=[]):
+                self.assertEqual(experiment.run(), 0)
+            expected = list(range(6))
+            random.Random(stable_seed(experiment.config['seed'], 'training-order', 0)).shuffle(expected)
+            self.assertEqual(seen, expected[:4])
+            self.assertEqual(experiment.progress['cursor'], 4)
+            self.assertEqual(experiment.progress['epoch'], 0)
+            self.assertEqual(experiment.progress['update'], 1)
+            self.assertEqual(experiment.progress['training_stop_reason'], 'prompt_cutoff')
+            self.assertTrue(experiment.progress['complete'])
+            self.assertFalse(experiment.progress['best_test_done'])
+            self.assertEqual(evaluations, [('update-1', 'validation'), ('pilot-4-final', 'test')])
+            manifest = json.loads((run / 'run_budget.json').read_text())
+            self.assertEqual(manifest['training_task_ids'], expected[:4])
+            self.assertEqual(json.loads((run / 'config.json').read_text()), small_config())
+
+    def test_adding_budget_to_partial_old_checkpoint_matches_direct_budget_all_arms(self):
+        for arm in ('root', 'entropy_cf', 'r_cf', 'gradient_ce_cf'):
+            with self.subTest(arm=arm), self.temporary_directory() as directory:
+                direct_path = Path(directory) / 'direct/training' / arm
+                self.activate_budget(direct_path)
+                direct = self.create(direct_path, arm, verify=False)
+                with patch('hindsight_grpo.plots.make_plots', return_value=[]):
+                    self.assertEqual(direct.run(), 0)
+                expected = direct.model.adapter.weight.detach().clone()
+                self.close(direct)
+                run = Path(directory) / 'old/training' / arm
+                old = self.create(run, arm, verify=False)
+                checkpoint = old.checkpoint
+                def interrupt(*args, **kwargs):
+                    checkpoint(*args, **kwargs)
+                    if old.progress['cursor'] == 2:
+                        old.signals.requested = True
+                old.checkpoint = interrupt
+                self.assertEqual(old.run(), 75)
+                self.assertEqual(old.progress['accumulation_count'], 2)
+                self.close(old)
+                self.activate_budget(run)
+                resumed = self.create(run, arm, verify=False)
+                with patch('hindsight_grpo.plots.make_plots', return_value=[]):
+                    self.assertEqual(resumed.run(), 0)
+                self.assertEqual(resumed.progress['prompts_processed'], 4)
+                torch.testing.assert_close(resumed.model.adapter.weight, expected, rtol=0, atol=0)
+                labels = {(record['label'], record['split']) for kind, record, _ in resumed.tracker.records
+                          if kind == 'evaluation'}
+                self.assertNotIn(('best', 'test'), labels)
+
+    def test_budget_refuses_to_rewind_a_checkpoint_past_the_cutoff(self):
+        with self.temporary_directory() as directory:
+            run = Path(directory) / 'group/training/root'
+            old = self.create(run, verify=False)
+            old.progress['prompts_processed'] = 5
+            old.checkpoint()
+            self.close(old)
+            self.activate_budget(run)
+            with self.assertRaisesRegex(RuntimeError, 'already exceeds'):
+                self.create(run, verify=False)
+
+    def test_expired_budget_preserves_checkpoint_without_claiming_completion(self):
+        with self.temporary_directory() as directory:
+            run = Path(directory) / 'group/training/root'
+            self.activate_budget(run, expired=True)
+            experiment = self.create(run, verify=False)
+            experiment.collect_prompt = Mock(side_effect=AssertionError('must not train'))
+            self.assertEqual(experiment.run(), 0)
+            self.assertFalse(experiment.progress['complete'])
+            self.assertTrue(experiment.progress['budget_exhausted'])
+            self.assertTrue((run / 'checkpoints/latest.pt').exists())
+            self.assertFalse((run / 'complete.json').exists())
+            self.assertEqual(json.loads((run / 'progress.json').read_text())['progress/phase'], 'budget_exhausted')
 
 
 if __name__ == '__main__':

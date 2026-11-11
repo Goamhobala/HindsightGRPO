@@ -122,7 +122,7 @@ Training records separate collection, scoring, conditional rollouts, reward exec
 
 Checkpoints use atomic replacement/fsync, save adapters, optimizer, random states, accumulated root and counterfactual gradients, epoch/cursor, and W&B identity. They are saved after each completed prompt. The last two prompts of each epoch are averaged as a two-prompt update. A signal stops at a safe prompt/evaluation-problem boundary; completed examples are not repeated or skipped. In-flight work may be replayed after a hard kill. Partial validation/test results are persisted per problem. Best-checkpoint test evaluation restores final weights before saving any interrupted training state.
 
-At the scheduler's five-minute warning, the wrapper forwards a checkpoint signal and queues a successor with an `afterany` dependency, keeping the same group/run directories. Successors resume until completion. All job IDs are appended to `submissions.tsv`. Cancel a queued successor as well when intentionally stopping an experiment. Ordinary failures stop rather than hiding a broken mathematical or logging check.
+At the scheduler's twenty-minute warning, the wrapper forwards a checkpoint signal and queues a successor with an `afterany` dependency, keeping the same group/run directories. Successors resume until completion. All job IDs are appended to `submissions.tsv`. Cancel a queued successor as well when intentionally stopping an experiment. A manual TERM suppresses further submissions by the updated wrapper. Previously submitted scripts retain their original warning/traps. Ordinary failures stop rather than hiding a broken mathematical or logging check.
 
 ```bash
 .venv/bin/python -m pytest
@@ -133,6 +133,90 @@ tail -f runtime/logs/<arm>-<job-id>.out
 CPU tests cover literal upstream FP32/BF16 sampler agreement, block/history restoration, conditional invariants, all selectors and gradient finite differences, the likelihood counterexample, root/KL mathematics, synthetic optimizer updates for all four arms, valid-state averaging, checkpoint/RNG/partial-gradient recovery, evaluation caching, and strict W&B behavior. The Linux sandbox integration is skipped outside a SLURM Linux environment. GPU preflight verifies the actual model, mask ID, bidirectionality, frozen/current score equality, and finite nonzero LoRA updates before the four real verification updates.
 
 See [docs/upstream.md](docs/upstream.md) and [docs/reward_sandbox.md](docs/reward_sandbox.md) for implementation details.
+
+## Continue an existing group with a 200-problem budget
+
+This opt-in pilot stops at **200 total training problems / 50 optimizer updates**,
+including work already completed. All arms use the same first 200 problems in
+the original seeded epoch-zero shuffle. The scientific config, W&B IDs, root and
+counterfactual sampling, optimizer state, and partial gradients remain compatible.
+Without a group budget, the original full protocol still applies.
+
+The pilot performs one final full validation and one final test on a deterministic
+100-problem held-out subset, with eight samples per problem. Its matched baseline
+reuses existing pretrained problem caches; missing baseline problems are generated
+only before any optimizer updates. Existing full baseline summaries stay intact.
+Intermediate validation and the separate best-checkpoint test are skipped. The
+selected IDs and budget are published as a protocol artifact and saved per arm in
+run_budget.json. Pilot test metrics use separate `pilot-200-pretrained` and
+`pilot-200-final` labels. This is a budget-limited pilot, not the full three-epoch result.
+
+First stop the old processes gracefully. On the cluster, inspect the **current**
+IDs, including automatic successors; original job IDs may already have finished:
+
+```bash
+squeue -u "$USER" -o '%.18i %.18j %.10T %.30E %R'
+tail -n 20 runtime/logs/submissions.tsv
+```
+
+Cancel this group's pending successors first. Signal its running batch scripts
+with TERM so the wrapper forwards the request to Python. Replace the capitalized
+placeholders below with the actual IDs; do not include unrelated jobs:
+
+```bash
+scancel --state=PENDING PENDING_JOB_IDS
+scancel --batch --signal=TERM RUNNING_JOB_IDS
+```
+
+Explicit signalling leaves time for the current prompt and artifact uploads to
+finish. Ordinary `scancel` can escalate to SIGKILL after the site's KillWait;
+USR1 invokes the old wrapper's successor-submission trap. Wait until these runs
+leave the queue, then check for and cancel any successors created while stopping.
+Already completed prompts remain in latest.pt; a hard kill can lose the in-flight
+prompt. W&B is suitable for monitoring, while scheduler control requires cluster
+access. See the official [scancel documentation](https://slurm.schedmd.com/scancel.html).
+
+Update the cluster checkout with these changes, keeping runtime/ intact. If using
+the supplied pilot200.patch instead of synchronizing Git, copy it to the cluster
+repository, then run `git apply --check pilot200.patch` and `git apply pilot200.patch`.
+After the old jobs are stopped, activate the group budget and submit the same group:
+
+```bash
+.venv/bin/python -m hindsight_grpo.budget --group hindsight-20261109T073222Z
+export EXPERIMENT_GROUP=hindsight-20261109T073222Z
+bash scripts/submit.sh
+```
+
+The default budget permits 36 further elapsed hours for training and reserves the
+remainder of 48 elapsed hours for evaluation. Time starts at activation, includes
+queue/startup delays, and is shared across all arms and successors. Reactivation
+preserves the original deadlines. Training stops at a complete optimizer batch;
+the overall deadline stops evaluation at a sample boundary, preserving completed
+problems. A deadline can therefore yield fewer than 200 training problems or an
+incomplete evaluation; those runs are marked explicitly. Budget expiration is not
+reported as successful completion. No checkpoint beyond 200 prompts is rewound:
+such a resume fails with an explanation. Check `latest_update` in W&B before
+activation if the runs have continued substantially since the last snapshot.
+
+W&B summaries now update after every saved training prompt and every evaluation
+sample, including `progress/phase`, training counts/target, evaluation problem and
+sample counts, rough training ETA, saved checkpoint counts, and current SLURM job
+ID. Local progress.json and progress.jsonl retain the same status. A paused run
+reports phase `paused`; an expired incomplete run reports `budget_exhausted`.
+
+To obtain a small status file locally without a VPN, authenticate locally with
+`.venv/bin/wandb login` if needed, then run:
+
+```bash
+.venv/bin/python scripts/wandb_status.py \
+  --entity goamhobala-university-of-cape-town \
+  --group hindsight-20261109T073222Z \
+  --output downloads/wandb-status.json
+```
+
+The export reads run summaries only and never exports credentials. API keys belong
+in the W&B login flow, not in chat or repository files. Older processes expose
+their existing summary fields until they restart with the updated code.
 
 ## Scientific scope
 

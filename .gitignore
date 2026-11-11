@@ -8,3 +8,4 @@ vendor/
 .test-tools/
 *.egg-info/
 .DS_Store
+downloads/

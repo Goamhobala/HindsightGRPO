@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hindsight_grpo.evaluation import StopRequested, evaluate, pass_at_k
+from hindsight_grpo.evaluation import BudgetExpired, StopRequested, evaluate, pass_at_k
 
 
 @pytest.mark.parametrize("n", range(1, 8))
@@ -187,3 +187,50 @@ def test_evaluation_cache_rejects_different_checkpoint_identity(tmp_path):
     run_evaluation(tmp_path, checkpoint_id="best-update-7")
     with pytest.raises(ValueError, match="provenance or sample-count"):
         run_evaluation(tmp_path, checkpoint_id="best-update-8")
+
+
+def test_pilot_reuses_pretrained_subset_without_overwriting_full_baseline(tmp_path):
+    evaluate(FakeSampler(), FakeTokenizer(), FakeRewardRunner(), ROWS, 'test', 'pretrained',
+             CONFIG, tmp_path, FakeTracker(), 0)
+    original = tmp_path / 'evaluation/pretrained/test/summary.json'
+    before = original.read_bytes()
+    sampler, rewards, tracker = FakeSampler(), FakeRewardRunner(), FakeTracker()
+    result = evaluate(sampler, FakeTokenizer(), rewards, ROWS[:1], 'test', 'pilot-4-pretrained',
+                      CONFIG, tmp_path, tracker, 0, checkpoint_id='pretrained', cache_source='pretrained')
+    assert sampler.calls == rewards.calls == []
+    assert result['problems'] == 1
+    assert result['accuracy'] == .5
+    assert original.read_bytes() == before
+    assert len(tracker.records) == 1
+    assert tracker.records[0][1]['label'] == 'pilot-4-pretrained'
+
+
+def test_pilot_reuse_rejects_wrong_pretrained_cache_provenance(tmp_path):
+    import json
+    evaluate(FakeSampler(), FakeTokenizer(), FakeRewardRunner(), ROWS, 'test', 'pretrained',
+             CONFIG, tmp_path, FakeTracker(), 0)
+    path = tmp_path / 'evaluation/pretrained/test/10.json'
+    record = json.loads(path.read_text())
+    record['provenance']['checkpoint_id'] = 'different-checkpoint'
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match='provenance'):
+        evaluate(FakeSampler(), FakeTokenizer(), FakeRewardRunner(), ROWS, 'test', 'pilot-4-pretrained',
+                 CONFIG, tmp_path, FakeTracker(), 0, checkpoint_id='pretrained', cache_source='pretrained')
+
+
+def test_evaluation_reports_sample_and_problem_progress(tmp_path):
+    progress = []
+    evaluate(FakeSampler(), FakeTokenizer(), FakeRewardRunner(), ROWS, 'validation', 'update-7',
+             CONFIG, tmp_path, FakeTracker(), 7, progress_callback=progress.append)
+    assert progress[0]['progress/problems_completed'] == 0
+    assert progress[-1]['progress/problems_completed'] == 2
+    assert progress[-1]['progress/problems_total'] == 2
+    assert any(p['progress/samples_completed'] == 1 for p in progress)
+
+
+def test_budget_deadline_stops_without_generating_a_problem(tmp_path):
+    sampler = FakeSampler()
+    with pytest.raises(BudgetExpired):
+        evaluate(sampler, FakeTokenizer(), FakeRewardRunner(), ROWS, 'test', 'final',
+                 CONFIG, tmp_path, FakeTracker(), 7, deadline_unix=1)
+    assert sampler.calls == []

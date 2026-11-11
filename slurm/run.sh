@@ -9,7 +9,7 @@
 #SBATCH --time=2-00:00:00
 #SBATCH --mail-user=yhxjin001@myuct.ac.za
 #SBATCH --mail-type=ALL
-#SBATCH --signal=B:USR1@300
+#SBATCH --signal=B:USR1@1200
 #SBATCH --requeue
 #SBATCH --output=runtime/logs/%x-%j.out
 #SBATCH --error=runtime/logs/%x-%j.err
@@ -25,7 +25,17 @@ case "$arm" in root|entropy_cf|r_cf|gradient_ce_cf) ;; *) exit 2 ;; esac
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 run_child=0
 successor_scheduled=0
+stop_requested=0
+budget_file="runtime/runs/$group/run_budget.json"
+if [[ -f "$budget_file" ]]; then
+  budget_expired="$(.venv/bin/python -c 'import json,sys,time; print(int(time.time() >= json.load(open(sys.argv[1]))["deadline_unix"]))' "$budget_file")"
+  if [[ "$budget_expired" == 1 ]]; then
+    echo "Run budget has expired for $group; no GPU work will start."
+    exit 0
+  fi
+fi
 schedule_successor() {
+  if [[ "$stop_requested" == 1 ]]; then return; fi
   if [[ "$successor_scheduled" == 0 ]]; then
     successor_scheduled=1
     next_id="$(sbatch --parsable --dependency="afterany:$SLURM_JOB_ID" \
@@ -35,12 +45,13 @@ schedule_successor() {
   if [[ "$run_child" != 0 ]]; then kill -USR1 "$run_child" 2>/dev/null || true; fi
 }
 forward_stop() {
+  stop_requested=1
   if [[ "$run_child" != 0 ]]; then kill -TERM "$run_child" 2>/dev/null || true; fi
 }
 trap schedule_successor USR1
 trap forward_stop TERM INT
 run_python() {
-  if [[ "$successor_scheduled" == 1 ]]; then return 75; fi
+  if [[ "$successor_scheduled" == 1 || "$stop_requested" == 1 ]]; then return 75; fi
   .venv/bin/python -u "$@" &
   run_child=$!
   set +e
@@ -49,7 +60,7 @@ run_python() {
   while kill -0 "$run_child" 2>/dev/null; do wait "$run_child"; result=$?; done
   set -e
   run_child=0
-  if [[ "$successor_scheduled" == 1 && "$result" == 0 ]]; then return 75; fi
+  if [[ ( "$successor_scheduled" == 1 || "$stop_requested" == 1 ) && "$result" == 0 ]]; then return 75; fi
   return "$result"
 }
 report="runtime/preflight/$group/$arm.json"
