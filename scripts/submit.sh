@@ -1,5 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
+arms=(root entropy_cf r_cf gradient_ce_cf)
+# Guard empty-array expansions below for Bash versions with strict nounset behavior.
+mode_args=()
+selected_arm=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --arm)
+      if [[ $# -lt 2 ]]; then echo '--arm requires a value' >&2; exit 2; fi
+      case "$2" in root|entropy_cf|r_cf|gradient_ce_cf) ;; *) echo 'Unknown arm' >&2; exit 2 ;; esac
+      arms=("$2"); selected_arm=1; shift 2 ;;
+    --evaluate-only) mode_args=(--evaluate-only); shift ;;
+    --help) echo 'Usage: bash scripts/submit.sh [--arm ARM] [--evaluate-only]'; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+if [[ ${#mode_args[@]} != 0 && "$selected_arm" != 1 ]]; then
+  echo '--evaluate-only requires an explicit --arm' >&2
+  exit 2
+fi
 source "$(dirname "$0")/env.sh"
 : "${WANDB_API_KEY:?Export WANDB_API_KEY before submission; its value is never written to the repository.}"
 for command in sbatch sinfo scontrol sacctmgr; do
@@ -22,9 +41,9 @@ export EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-hindsight-$(date -u +%Y%m%dT%H%M%SZ
 .venv/bin/python -m pytest
 # Authentication/network check is online; no model work is queued if it fails.
 .venv/bin/python scripts/check_wandb.py
-for arm in root entropy_cf r_cf gradient_ce_cf; do
+for arm in "${arms[@]}"; do
   job_id="$(sbatch --parsable --job-name="$arm" --time="$HINDSIGHT_TIME_LIMIT" \
-      --export=ALL slurm/run.sh "$arm" "$EXPERIMENT_GROUP")"
+      --export=ALL slurm/run.sh "$arm" "$EXPERIMENT_GROUP" ${mode_args[@]+"${mode_args[@]}"})"
   printf '%s\t%s\t%s\n' "$arm" "$job_id" "$EXPERIMENT_GROUP" | tee -a runtime/logs/submissions.tsv
 done
-echo "Queued four arms in group $EXPERIMENT_GROUP. SLURM and W&B progress: runtime/logs and runtime/runs."
+echo "Queued ${#arms[@]} arm(s) in group $EXPERIMENT_GROUP. SLURM and W&B progress: runtime/logs and runtime/runs."

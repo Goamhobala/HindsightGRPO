@@ -37,23 +37,26 @@ def average_metrics(records):
 
 
 class Experiment:
-    def __init__(self, config, arm, run_dir, group, verify=False):
+    def __init__(self, config, arm, run_dir, group, verify=False, evaluate_only=False):
         self.lock = None
         self.tracker = None
         self._closed = False
         try:
-            self._initialize(config, arm, run_dir, group, verify)
+            self._initialize(config, arm, run_dir, group, verify, evaluate_only)
         except BaseException as error:
             # Initialization can fail after opening the lock or starting W&B.
             # Release both before a caller removes a temporary run directory.
             self.__exit__(type(error), error, error.__traceback__)
             raise
 
-    def _initialize(self, config, arm, run_dir, group, verify=False):
+    def _initialize(self, config, arm, run_dir, group, verify=False, evaluate_only=False):
         self.config, self.arm, self.run_dir = config, arm, Path(run_dir)
         self.verify = verify
         budget_path = self.run_dir.parent.parent / "run_budget.json"
         self.budget = RunBudget.load(budget_path) if not verify and budget_path.exists() else None
+        self.evaluate_only = evaluate_only
+        if evaluate_only and (verify or self.budget is None):
+            raise ValueError("Evaluation-only mode requires a full training run with an active budget")
         self.phase = "initializing"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.lock = (self.run_dir / ".training.lock").open("w")
@@ -104,10 +107,20 @@ class Experiment:
         active_budget = asdict(self.budget) if self.budget else None
         if saved_budget is not None and saved_budget != active_budget:
             raise RuntimeError("Resume requires the same saved run budget and deadlines")
+        self.evaluate_only = self.evaluate_only or self.progress.get("evaluation_only", False)
         if self.budget:
-            if self.progress["prompts_processed"] > self.budget.training_prompts:
-                raise RuntimeError("Checkpoint already exceeds the training cutoff; cannot undo updates")
+            if self.progress["prompts_processed"] > self.budget.training_prompts and not self.evaluate_only:
+                raise RuntimeError(f"Checkpoint already exceeds the training cutoff: "
+                    f"{self.progress['prompts_processed']} prompts, {self.progress['update']} updates; "
+                    f"cutoff is {self.budget.training_prompts} prompts. Cannot undo updates. "
+                    "Use --evaluate-only to evaluate these weights without more training, "
+                    "or restore an exact-cutoff checkpoint for a matched comparison.")
+            if saved_budget is None:
+                # Full-run completion flags do not describe the new pilot test scope.
+                self.progress["complete"] = self.progress["final_test_done"] = False
             self.progress["run_budget"] = active_budget
+        if self.evaluate_only:
+            self.progress["evaluation_only"] = True
         self.previous_wall = self.progress["wall_seconds"]
         self.rollout = frozen_snapshot(self.model)
         self.sampler = Sampler(self.rollout, self.tokenizer,
@@ -224,14 +237,34 @@ class Experiment:
         if self.budget:
             values.update({"protocol/budget": self.budget.label,
                 "protocol/test_problems": self.budget.test_problems,
+                "protocol/evaluation_only": self.evaluate_only,
+                "protocol/training_budget_matched": self.training_budget_matched(),
+                "protocol/applied_training_prompts": p["prompts_processed"] - p["accumulation_count"],
+                "protocol/extra_training_prompts": max(0,
+                    p["prompts_processed"] - p["accumulation_count"] - self.budget.training_prompts),
                 "budget/training_deadline_unix": self.budget.training_deadline_unix,
                 "budget/deadline_unix": self.budget.deadline_unix})
         self.tracker.progress(values, p["update"])
+
+    def training_budget_matched(self):
+        return bool(self.budget and self.progress["prompts_processed"]
+                    - self.progress["accumulation_count"] == self.budget.training_prompts
+                    and self.progress["update"] * self.config["prompts_per_update"]
+                    == self.budget.training_prompts)
+
+    def final_test_label(self):
+        if not self.budget:
+            return "final"
+        label = f"{self.budget.label}-final"
+        return label if self.training_budget_matched() else f"{label}-update-{self.progress['update']}"
 
     def training_cutoff_reached(self):
         if not self.budget:
             return False
         p = self.progress
+        if self.evaluate_only:
+            p["training_stop_reason"] = "evaluation_only"
+            return True
         if p["prompts_processed"] >= self.budget.training_prompts:
             p["training_stop_reason"] = "prompt_cutoff"
             return True
@@ -429,6 +462,8 @@ class Experiment:
                     self.evaluate("pretrained", "test")
                     p["baseline_done"] = True
                     self.checkpoint()
+                if self.evaluate_only:
+                    p["training_stop_reason"] = "evaluation_only"
                 for epoch in range(p["epoch"], c["epochs"]):
                     if self.training_cutoff_reached():
                         break
@@ -507,7 +542,7 @@ class Experiment:
                         self.validate()
                     self.checkpoint("final", upload=True)
                     if not p["final_test_done"]:
-                        self.evaluate(f"{self.budget.label}-final" if self.budget else "final", "test")
+                        self.evaluate(self.final_test_label(), "test")
                         p["final_test_done"] = True
                         self.checkpoint()
                     if not self.budget and not p["best_test_done"]:
@@ -538,6 +573,10 @@ class Experiment:
                     atomic_json(self.run_dir / "complete.json", {"arm": self.arm, "updates": p["update"],
                                 "prompts": p["prompts_processed"], "wandb_url": self.tracker.url,
                                 "budget": asdict(self.budget) if self.budget else None,
+                                "evaluation_only": self.evaluate_only,
+                                "applied_training_prompts": p["prompts_processed"] - p["accumulation_count"],
+                                "training_budget_matched": self.training_budget_matched() if self.budget else None,
+                                "final_test_label": self.final_test_label(),
                                 "training_stop_reason": p.get("training_stop_reason", "full_schedule")})
                     self.publish_progress("complete")
                 return 0
@@ -570,11 +609,14 @@ def main():
     parser.add_argument("--config", default="configs/experiment.json")
     parser.add_argument("--run-root", default="runtime/runs")
     parser.add_argument("--group", default=os.environ.get("EXPERIMENT_GROUP", "four-arm-full-mbpp"))
-    parser.add_argument("--verify-one-update", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--verify-one-update", action="store_true")
+    mode.add_argument("--evaluate-only", action="store_true",
+                      help="Finalize the saved weights without more training; report the actual training budget")
     args = parser.parse_args()
     config = load_config(args.config)
     run_dir = Path(args.run_root) / args.group / ("verification" if args.verify_one_update else "training") / args.arm
-    with Experiment(config, args.arm, run_dir, args.group, args.verify_one_update) as experiment:
+    with Experiment(config, args.arm, run_dir, args.group, args.verify_one_update, args.evaluate_only) as experiment:
         if experiment.progress.get("complete"):
             code = 0
         else:

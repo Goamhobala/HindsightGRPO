@@ -198,6 +198,31 @@ reported as successful completion. No checkpoint beyond 200 prompts is rewound:
 such a resume fails with an explanation. Check `latest_update` in W&B before
 activation if the runs have continued substantially since the last snapshot.
 
+If one arm has already passed the cutoff, its checkpoint is preserved. To finish
+evaluating its current weights without collecting another prompt or taking another
+optimizer step, explicitly submit that arm in evaluation-only mode:
+
+```bash
+export EXPERIMENT_GROUP=hindsight-20261109T073222Z
+bash scripts/submit.sh --arm root --evaluate-only
+```
+
+This submits only root, so existing jobs for the other arms can continue. Use it
+after the failed root job has exited and any duplicate queued root successor is
+removed. Evaluation uses the same test subset and the existing budget deadlines.
+The mode is saved in the checkpoint and forwarded to successor jobs.
+
+Evaluation-only mode preserves accumulated gradients without applying them. Its
+W&B protocol fields and complete.json report the actual optimizer update, applied
+training prompts, and whether the model matches the training budget. For example,
+203 processed prompts with three still accumulated means the weights have trained
+on 200 prompts; 204 processed prompts after update 51 means they have trained on
+204. An unmatched result uses a test label such as `pilot-200-final-update-51`.
+It must not be presented as an equal-training-budget comparison. Exact matching
+requires a saved update-50 checkpoint; evaluation-only mode cannot reconstruct
+past weights or undo updates. Normal training continues to reject checkpoints
+beyond the cutoff unless evaluation-only mode was explicitly selected.
+
 W&B summaries now update after every saved training prompt and every evaluation
 sample, including `progress/phase`, training counts/target, evaluation problem and
 sample counts, rough training ETA, saved checkpoint counts, and current SLURM job

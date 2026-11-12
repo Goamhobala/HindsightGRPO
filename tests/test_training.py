@@ -139,8 +139,9 @@ class TrainingTests(unittest.TestCase):
     def tearDown(self):
         self.stack.close()
         torch.set_num_threads(self.previous_threads)
-    def create(self, directory, arm='root', verify=True):
-        experiment = Experiment(small_config(), arm, directory, 'synthetic', verify=verify)
+    def create(self, directory, arm='root', verify=True, evaluate_only=False):
+        experiment = Experiment(small_config(), arm, directory, 'synthetic', verify=verify,
+                                evaluate_only=evaluate_only)
         self.directory_resources.enter_context(experiment)
         return experiment
     def close(self, experiment):
@@ -498,6 +499,63 @@ class TrainingTests(unittest.TestCase):
             self.assertTrue((run / 'checkpoints/latest.pt').exists())
             self.assertFalse((run / 'complete.json').exists())
             self.assertEqual(json.loads((run / 'progress.json').read_text())['progress/phase'], 'budget_exhausted')
+
+    def test_evaluation_only_preserves_saved_weights_and_pending_gradients(self):
+        def eight_rows(**kwargs):
+            data = fake_data(**kwargs)
+            data['train'] = [{'task_id': i, 'text': str(i), 'test_list': []} for i in range(8)]
+            return data
+        for prompts in (6, 8):
+            with self.subTest(prompts=prompts), self.temporary_directory() as directory, \
+                    patch('hindsight_grpo.train.load_mbpp', eight_rows):
+                run = Path(directory) / 'group/training/root'
+                old = self.create(run, verify=False)
+                checkpoint = old.checkpoint
+                def interrupt(*args, **kwargs):
+                    checkpoint(*args, **kwargs)
+                    if old.progress['prompts_processed'] >= prompts:
+                        old.signals.requested = True
+                old.checkpoint = interrupt
+                self.assertEqual(old.run(), 75)
+                weights = {name: value.clone() for name, value in old.model.state_dict().items()}
+                gradients = {name: parameter.grad.clone() for name, parameter in old.model.named_parameters()
+                             if parameter.grad is not None}
+                optimizer = copy.deepcopy(old.optimizer.state_dict())
+                self.close(old)
+                self.activate_budget(run)
+                resumed = self.create(run, verify=False, evaluate_only=True)
+                resumed.collect_prompt = Mock(side_effect=AssertionError('must not train'))
+                resumed.optimizer.step = Mock(side_effect=AssertionError('must not update'))
+                with patch('hindsight_grpo.plots.make_plots', return_value=[]):
+                    self.assertEqual(resumed.run(), 0)
+                self.assertEqual(resumed.progress['prompts_processed'], prompts)
+                self.assertEqual(resumed.progress['update'], prompts // 4)
+                self.assertEqual(resumed.progress['accumulation_count'], prompts % 4)
+                for name, value in resumed.model.state_dict().items():
+                    torch.testing.assert_close(value, weights[name], rtol=0, atol=0)
+                for name, parameter in resumed.model.named_parameters():
+                    if name in gradients:
+                        torch.testing.assert_close(parameter.grad, gradients[name], rtol=0, atol=0)
+                for key, state in resumed.optimizer.state_dict()['state'].items():
+                    for field, value in state.items():
+                        torch.testing.assert_close(value, optimizer['state'][key][field], rtol=0, atol=0)
+                completion = json.loads((run / 'complete.json').read_text())
+                self.assertTrue(completion['evaluation_only'])
+                self.assertEqual(completion['training_budget_matched'], prompts == 6)
+                self.assertEqual(completion['applied_training_prompts'], 4 if prompts == 6 else 8)
+                self.assertEqual(completion['final_test_label'],
+                                 'pilot-4-final' if prompts == 6 else 'pilot-4-final-update-2')
+                self.assertEqual(completion['training_stop_reason'], 'evaluation_only')
+                self.close(resumed)
+                # Successors remain evaluation-only even if the CLI flag is omitted.
+                again = self.create(run, verify=False)
+                self.assertTrue(again.evaluate_only)
+                self.assertTrue(again.progress['complete'])
+
+    def test_evaluation_only_requires_a_budget(self):
+        with self.temporary_directory() as directory:
+            with self.assertRaisesRegex(ValueError, 'active budget'):
+                self.create(directory, verify=False, evaluate_only=True)
 
 
 if __name__ == '__main__':
