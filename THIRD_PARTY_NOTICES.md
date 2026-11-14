@@ -1,5 +1,13 @@
 # Upstream attribution
 
+The new `src/d1_exclusion/d1_objective.py` implements the diffu-GRPO conventions
+audited from [d1](https://github.com/dllm-reasoning/d1) at commit
+`faf85d6dcea40477c722c467023c73b08a46cb82`, distributed under Apache License 2.0.
+The standard Apache 2.0 license text is reproduced in
+`licenses/dllm-Apache-2.0.txt`. Source-file hashes, references and architectural
+adaptations are recorded in `docs/d1_reference.md`. This adaptation does not
+imply endorsement by the d1 authors.
+
 The MDLM Gumbel-Max/confidence sampler and denoising likelihood convention in
 `src/hindsight_grpo/sampler.py` and `src/hindsight_grpo/model.py` are adapted from
 [dLLM](https://github.com/ZHZisZZ/dllm), commit

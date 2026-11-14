@@ -1,5 +1,17 @@
 # HindsightGRPO
 
+The new **d1 token-exclusion experiment** is isolated under `src/d1_exclusion`,
+`configs/d1_exclusion`, and `scripts/d1_exclusion`. Its four arms use d1 diffu-GRPO
+with root-only training or entropy-selected exclusion strengths 0, 0.5 and 1.
+The three counterfactual arms share outcome-stratified reference selection:
+mixed root groups choose successful or failed references with equal probability,
+then sample uniformly within that class; homogeneous groups sample uniformly.
+Counterfactual reward contrasts determine token updates for either outcome.
+See [the experiment guide](docs/d1_exclusion.md) for the 150-task protocol,
+submission, checkpoint/resume and separate evaluation commands, and
+[the official d1 source audit](docs/d1_reference.md) for implementation conventions.
+The earlier experiment and its instructions follow below.
+
 Four matched LoRA experiments on the **diffusion** Qwen2.5-Coder-0.5B-Instruct MDLM: `root`, `entropy_cf`, `r_cf`, and `gradient_ce_cf`. This repository prepares and submits the full experiment; no HPC jobs have been submitted from the development machine.
 
 ## On the HPC
